@@ -11,7 +11,7 @@
 #SBATCH --gres=gpu:rtx_4090:1
 #SBATCH --array=0-23%7
 #SBATCH --mail-type=FAIL,END
-#SBATCH --mail-user=${USER}@ethz.ch
+#SBATCH --mail-user=${USER}@$(hostname -d)
 
 # ===========================================================================
 # Document Intelligence Pipeline — Multi-Stage Slurm Orchestrator

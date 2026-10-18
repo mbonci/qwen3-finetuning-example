@@ -19,7 +19,7 @@ This repository implements a **mock data strategy** that faithfully mimics the p
 - `src/generate_mock_data.py` produces synthetic statute-like text pairs using topic-aligned templates drawn from real legislative domains (Health, Education, Government Operations, Environment, etc.)
 - Mock pairs reproduce the **boundary-sampling mechanics** of the real pipeline: cosine similarity bins (q40–q100), BM25-retrieved hard negatives, and ordinal judge scores calibrated to mirror the real label distribution
 - All training, inference, and clustering scripts run end-to-end on the mock dataset with no modification
-- Real results reported in this README were produced by running the full pipeline on the proprietary corpus on the ETH Zurich Euler HPC cluster
+- Real results reported in this README were produced by running the full pipeline on the proprietary corpus on an institutional HPC cluster
 
 ---
 
@@ -80,7 +80,7 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   │  │  SLURM Array Job         │   │  Evaluation                          │  │
   │  │  24 tasks × 1 GPU        │   │  Per-topic binary F1 on held-out     │  │
   │  │  RTX 4090 × 32GB         │   │  validation pairs                    │  │
-  │  │  Euler HPC cluster       │   │  Best checkpoint selection           │  │
+  │  │  Institutional HPC       │   │  Best checkpoint selection           │  │
   │  └──────────────────────────┘   └──────────────────────────────────────┘  │
   └──────────────────────────────────┬───────────────────────────────────────┘
                                      │
@@ -190,7 +190,7 @@ dimensionality reduction before clustering:
 | Optimizer | AdamW |
 | Training pairs | ~100K labeled pairs → ~300K triplets |
 | Hardware | 1× RTX 4090, 32 GB VRAM |
-| HPC cluster | ETH Zurich Euler (SLURM array, 24 tasks) |
+| HPC cluster | Institutional HPC cluster (SLURM array, 24 tasks) |
 
 ### Dimensionality Reduction & Clustering
 
