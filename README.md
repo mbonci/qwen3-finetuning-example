@@ -274,6 +274,14 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 | `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Trained on 8M-statute contrastive pairs |
 | **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
 
+**Cosine similarity distributions before and after fine-tuning** (two representative topics, proprietary corpus):
+
+| Health | Government Operations |
+|:---:|:---:|
+| ![Health KDE](assets/cosine_kde_health.png) | ![Government Operations KDE](assets/cosine_kde_government_operations.png) |
+
+Filled = before fine-tuning; dashed = after. Green = positive pairs (similar statutes), red = negative pairs (dissimilar). After training the distributions separate cleanly — positives shift right toward cosine ≈ 0.9 and negatives shift left toward ≈ 0.0. `train.py` generates an equivalent plot for any run at `runs/<name>/task_00/visualization/cosine_kde.png`.
+
 ### Validation Methodology
 
 Evaluation is implemented in `src/evaluate.py`. Several design decisions are non-obvious:

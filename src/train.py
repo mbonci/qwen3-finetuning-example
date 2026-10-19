@@ -380,6 +380,55 @@ class BinaryClassificationEvaluatorPrimaryF1:
 
 
 # ---------------------------------------------------------------------------
+# Cosine distribution visualisation
+# ---------------------------------------------------------------------------
+
+def get_similarity_distributions(model, s1: list[str], s2: list[str], labels: list[int], batch_size: int = 128) -> dict:
+    """Encode pairs and return cosine similarities split by positive/negative label."""
+    import torch.nn.functional as F
+    e1 = np.array(model.encode(s1, batch_size=batch_size, normalize_embeddings=False, show_progress_bar=False))
+    e2 = np.array(model.encode(s2, batch_size=batch_size, normalize_embeddings=False, show_progress_bar=False))
+    a = e1 / (np.linalg.norm(e1, axis=1, keepdims=True) + 1e-12)
+    b = e2 / (np.linalg.norm(e2, axis=1, keepdims=True) + 1e-12)
+    cosine = np.sum(a * b, axis=1)
+    labels_arr = np.array(labels)
+    return {
+        "cosine_positive": cosine[labels_arr == 1],
+        "cosine_negative": cosine[labels_arr == 0],
+    }
+
+
+def plot_cosine_kde(before: dict, after: dict, save_path: str) -> None:
+    """Save a before/after cosine KDE plot (positive vs negative pairs)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        logger.warning("matplotlib/seaborn not installed — skipping KDE plot")
+        return
+
+    all_vals = np.concatenate([before["cosine_positive"], before["cosine_negative"],
+                                after["cosine_positive"], after["cosine_negative"]])
+    xmin, xmax = float(np.min(all_vals)), float(np.max(all_vals))
+
+    plt.figure(figsize=(7, 5))
+    sns.kdeplot(before["cosine_positive"], label="Positive (before)", fill=True, color="green", alpha=0.3)
+    sns.kdeplot(after["cosine_positive"],  label="Positive (after)",  linestyle="--", color="green")
+    sns.kdeplot(before["cosine_negative"], label="Negative (before)", fill=True, color="red",   alpha=0.3)
+    sns.kdeplot(after["cosine_negative"],  label="Negative (after)",  linestyle="--", color="red")
+    plt.title("Cosine Distribution (KDE) — Positive vs Negative")
+    plt.xlim(xmin, xmax)
+    plt.legend()
+    plt.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    logger.info("KDE plot saved to %s", save_path)
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -399,6 +448,13 @@ def train(cfg: TrainConfig) -> None:
 
     logger.info("Loading model: %s", cfg.model_name)
     model = SentenceTransformer(cfg.model_name, trust_remote_code=True)
+
+    # --- Snapshot cosine distributions before training ---
+    pair_ds_for_viz = PairDatasetFromPairs(cfg.triplets_path)
+    s1_viz = [ex.texts[0] for ex in pair_ds_for_viz.examples]
+    s2_viz = [ex.texts[1] for ex in pair_ds_for_viz.examples]
+    labels_viz = [int(ex.label) for ex in pair_ds_for_viz.examples]
+    before_dists = get_similarity_distributions(model, s1_viz, s2_viz, labels_viz)
 
     # --- Objective 1: weighted pairwise contrastive ---
     pair_ds = PairDatasetFromPairs(cfg.triplets_path)
@@ -458,6 +514,12 @@ def train(cfg: TrainConfig) -> None:
     )
     logger.info("Training complete. Model saved to %s", output_dir / "final")
     (output_dir / "config.json").write_text(json.dumps(cfg.__dict__, default=str, indent=2))
+
+    # --- Snapshot cosine distributions after training and plot ---
+    trained_model = SentenceTransformer(str(output_dir / "final"), trust_remote_code=True)
+    after_dists = get_similarity_distributions(trained_model, s1_viz, s2_viz, labels_viz)
+    kde_path = str(output_dir / "visualization" / "cosine_kde.png")
+    plot_cosine_kde(before_dists, after_dists, save_path=kde_path)
 
 
 # ---------------------------------------------------------------------------
