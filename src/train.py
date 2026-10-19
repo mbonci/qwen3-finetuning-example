@@ -76,7 +76,6 @@ class TrainConfig:
     # Shared
     learning_rate: float = 2e-5
     warmup_steps: int = 100
-    max_seq_length: int = 512
     max_grad_norm: float = 1.0
     seed: int = 42
     # Set from SLURM_ARRAY_TASK_ID when running on HPC
@@ -400,7 +399,6 @@ def train(cfg: TrainConfig) -> None:
 
     logger.info("Loading model: %s", cfg.model_name)
     model = SentenceTransformer(cfg.model_name, trust_remote_code=True)
-    model.max_seq_length = cfg.max_seq_length
 
     # --- Objective 1: weighted pairwise contrastive ---
     pair_ds = PairDatasetFromPairs(cfg.triplets_path)

@@ -227,7 +227,6 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 |---|---|
 | Base model | `Qwen/Qwen3-Embedding-0.6B` |
 | Embedding dimension | 1024 |
-| Max sequence length | 512 tokens |
 | Loss 1 | WeightedContrastiveLoss (cosine distance) |
 | Contrastive margin | 0.7 |
 | Contrastive batch size | 8 |
