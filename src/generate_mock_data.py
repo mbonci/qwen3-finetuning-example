@@ -204,40 +204,72 @@ def _score_from_cosine(cosine: float) -> int:
         return random.choices([6, 7], weights=[0.4, 0.6])[0]
 
 
-def generate_pairs(n: int = 100, seed: int = 42) -> list[dict]:
+def generate_pairs(n_anchors: int = 40, seed: int = 42) -> list[dict]:
+    """Generate anchor-centric pairs so each anchor has both positives and negatives.
+
+    The critical invariant for non-zero triplet construction: the same anchor_id
+    must appear in at least one positive pair (score 1–3) AND at least one
+    negative pair (score 5–7). Unique-pair generation breaks this — no anchor
+    ever appears in both a positive and negative row, so the intersection
+    set(positives) ∩ set(negatives) is empty and build_triplets() produces zero
+    training examples.
+    """
     random.seed(seed)
     pairs = []
-    bins = ["q40_60", "q60_80", "q80_90", "q90_95", "q95_100"]
-    bin_weights = [0.10, 0.20, 0.30, 0.25, 0.15]
 
-    for i in range(n):
-        topic = random.choice(TOPICS)
+    for anchor_idx in range(n_anchors):
+        # Distribute anchors evenly across topics for coverage
+        topic = TOPICS[anchor_idx % len(TOPICS)]
         templates = TOPIC_TEMPLATES[topic]
-
-        anchor_tmpl, candidate_tmpl = random.sample(templates, 2) if len(templates) >= 2 else (templates[0], templates[0])
-
         state_a = random.choice(STATES)
-        remaining = [s for s in STATES if s != state_a]
-        state_b = random.choice(remaining)
+        anchor_text = _fill_template(random.choice(templates))
+        anchor_id = f"anchor-{topic.lower().replace(' ', '_')}-{anchor_idx:04d}"
 
-        bin_label = random.choices(bins, weights=bin_weights)[0]
-        cosine = _cosine_from_bin(bin_label)
-        score = _score_from_cosine(cosine)
+        # 2–3 positives: same topic, cosine ≥ 0.90, score ∈ {1, 2, 3}
+        n_pos = random.randint(2, 3)
+        for pos_idx in range(n_pos):
+            state_b = random.choice([s for s in STATES if s != state_a])
+            cosine = round(random.uniform(0.90, 0.99), 4)
+            score = random.choices([1, 2, 3], weights=[0.50, 0.35, 0.15])[0]
+            bin_label = "q95_100" if cosine >= 0.95 else "q90_95"
+            pairs.append({
+                "anchor_id": anchor_id,
+                "candidate_id": f"pos-{topic.lower().replace(' ', '_')}-{anchor_idx:04d}-{pos_idx}",
+                "text_a": anchor_text,
+                "text_b": _fill_template(random.choice(templates)),
+                "similarity_score": score,
+                "primary_topic_a": topic,
+                "cosine_similarity": cosine,
+                "bin": bin_label,
+                "pair_type": "within",
+                "state_a": state_a,
+                "state_b": state_b,
+            })
 
-        pairs.append({
-            "anchor_id": f"{state_a}-{topic.lower().replace(' ', '_')}-{i:04d}",
-            "candidate_id": f"{state_b}-{topic.lower().replace(' ', '_')}-{i:04d}",
-            "text_a": _fill_template(anchor_tmpl),
-            "text_b": _fill_template(candidate_tmpl),
-            "similarity_score": score,
-            "primary_topic_a": topic,
-            "cosine_similarity": cosine,
-            "bin": bin_label,
-            "pair_type": "within",
-            "state_a": state_a,
-            "state_b": state_b,
-        })
+        # 2–3 negatives: different topic, cosine ∈ [0.40, 0.55], score ∈ {5, 6, 7}
+        n_neg = random.randint(2, 3)
+        other_topics = [t for t in TOPICS if t != topic]
+        for neg_idx in range(n_neg):
+            neg_topic = random.choice(other_topics)
+            neg_templates = TOPIC_TEMPLATES[neg_topic]
+            state_b = random.choice([s for s in STATES if s != state_a])
+            cosine = round(random.uniform(0.40, 0.55), 4)
+            score = random.choices([5, 6, 7], weights=[0.25, 0.45, 0.30])[0]
+            pairs.append({
+                "anchor_id": anchor_id,
+                "candidate_id": f"neg-{neg_topic.lower().replace(' ', '_')}-{anchor_idx:04d}-{neg_idx}",
+                "text_a": anchor_text,
+                "text_b": _fill_template(random.choice(neg_templates)),
+                "similarity_score": score,
+                "primary_topic_a": topic,
+                "cosine_similarity": cosine,
+                "bin": "q40_60",
+                "pair_type": "across",
+                "state_a": state_a,
+                "state_b": state_b,
+            })
 
+    random.shuffle(pairs)
     return pairs
 
 
@@ -245,7 +277,7 @@ def main() -> None:
     output_path = Path(__file__).resolve().parent.parent / "data" / "mock_pairs.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pairs = generate_pairs(n=100)
+    pairs = generate_pairs(n_anchors=40)
     with output_path.open("w") as f:
         for pair in pairs:
             f.write(json.dumps(pair) + "\n")
@@ -255,11 +287,17 @@ def main() -> None:
         s = p["similarity_score"]
         score_dist[s] = score_dist.get(s, 0) + 1
 
-    print(f"Wrote {len(pairs)} pairs to {output_path}")
+    n_anchors = len({p["anchor_id"] for p in pairs})
+    print(f"Wrote {len(pairs)} pairs from {n_anchors} anchors to {output_path}")
     print(f"Score distribution: { {k: score_dist[k] for k in sorted(score_dist)} }")
     positives = sum(v for k, v in score_dist.items() if k <= 3)
-    negatives = sum(v for k, v in score_dist.items() if 4 <= k <= 7)
-    print(f"Positives (1-3): {positives}  |  Negatives (4-7): {negatives}")
+    negatives = sum(v for k, v in score_dist.items() if 5 <= k <= 7)
+    print(f"Positives (1-3): {positives}  |  Negatives (5-7): {negatives}")
+    # Verify triplet formation is possible
+    anchor_ids_pos = {p["anchor_id"] for p in pairs if p["similarity_score"] <= 3}
+    anchor_ids_neg = {p["anchor_id"] for p in pairs if p["similarity_score"] >= 5}
+    shared = anchor_ids_pos & anchor_ids_neg
+    print(f"Anchors with both pos+neg (triplet-eligible): {len(shared)}/{n_anchors}")
 
 
 if __name__ == "__main__":

@@ -26,9 +26,12 @@ Usage (mock / offline):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -268,12 +271,17 @@ async def _score_pairs_async_inner(
     rows = pairs_df.to_dict("records")
     results: list[dict] = []
 
-    for i, row in enumerate(rows):
-        result = await _score_one(client, model, row, semaphore)
-        results.append(result)
-        if checkpoint_path and (i + 1) % checkpoint_every == 0:
+    # Process in checkpoint-sized batches; within each batch all requests fire
+    # concurrently (bounded by the semaphore), not sequentially.
+    for batch_start in range(0, len(rows), checkpoint_every):
+        batch = rows[batch_start : batch_start + checkpoint_every]
+        batch_results = await asyncio.gather(
+            *[_score_one(client, model, row, semaphore) for row in batch]
+        )
+        results.extend(batch_results)
+        if checkpoint_path:
             pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
-            logger.info("Checkpoint saved at row %d", i + 1)
+            logger.info("Checkpoint saved at row %d", batch_start + len(batch))
 
     return pd.DataFrame(results)
 
@@ -380,3 +388,70 @@ def build_triplets(
     result = pd.DataFrame(triplets)
     logger.info("Built %d triplets from %d scored pairs", len(result), len(df_valid))
     return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    p = argparse.ArgumentParser(description="Data pipeline: mine or score pairs")
+    p.add_argument("--mode", choices=["mine", "score"], default="mine")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--task-id", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
+    p.add_argument("--n-tasks", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1)))
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--concurrency", type=int, default=35)
+    args = p.parse_args()
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "score":
+        if Path(args.input).suffix == ".jsonl":
+            with open(args.input) as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
+            input_df = pd.DataFrame(rows)
+        else:
+            input_df = pd.read_parquet(args.input)
+
+        scored = score_pairs_async(
+            input_df,
+            concurrency=args.concurrency,
+            checkpoint_path=args.checkpoint,
+        )
+        out_path = out_dir / f"scored_task_{args.task_id:02d}.parquet"
+        scored.to_parquet(out_path, index=False)
+        logger.info("Scored %d pairs → %s", len(scored), out_path)
+
+    elif args.mode == "mine":
+        logger.info("Mine mode: loading texts from %s (task %d/%d)", args.input, args.task_id, args.n_tasks)
+        if Path(args.input).suffix == ".jsonl":
+            with open(args.input) as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
+        else:
+            rows = pd.read_parquet(args.input).to_dict("records")
+
+        texts: dict[str, str] = {}
+        topic_map: dict[str, str] = {}
+        for row in rows:
+            texts.setdefault(row["anchor_id"], row.get("text_a", ""))
+            texts.setdefault(row["candidate_id"], row.get("text_b", ""))
+            if "primary_topic_a" in row:
+                topic_map.setdefault(row["anchor_id"], row["primary_topic_a"])
+
+        # Shard the doc list by task_id for array parallelism
+        all_ids = sorted(texts.keys())
+        shard_ids = all_ids[args.task_id :: args.n_tasks]
+        shard_texts = {k: texts[k] for k in shard_ids}
+        shard_topics = {k: topic_map.get(k, "Unknown") for k in shard_ids}
+
+        candidates = mine_candidates(shard_texts, shard_topics)
+        out_path = out_dir / f"pairs_task_{args.task_id:02d}.parquet"
+        candidates.to_parquet(out_path, index=False)
+        logger.info("Mined %d pairs → %s", len(candidates), out_path)

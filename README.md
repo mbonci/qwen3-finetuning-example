@@ -203,16 +203,24 @@ dimensionality reduction before clustering:
 
 ### Performance
 
-| Model | Clustering F1 | Notes |
+> **Historical research results — proprietary corpus only.** The numbers below
+> were produced by running the full pipeline on the institutional HPC cluster
+> against the 8M-statute corpus. They cannot be independently reproduced from
+> this public repository because the training corpus is not included. `src/experiment.py`
+> provides a synthetic demo that verifies gradient flow and metric correctness on
+> mock data; its output should not be compared to these figures.
+
+| Model | Pairwise Classification F1 | Notes |
 |---|---|---|
 | `Qwen3-Embedding-0.6B` (base) | 0.61 | Zero-shot, no fine-tuning |
 | `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Trained on 8M-statute contrastive pairs |
-| **Δ improvement** | **+0.20** | Macro F1 on held-out similar pairs |
+| **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
 
-Clustering F1 is measured on a held-out validation set of labeled pairs: two
-documents are predicted similar if they share a cluster label. The metric captures
-the practical downstream utility of the embedding space — whether statute groups
-produced by the model are semantically coherent.
+**Metric definition** — pairwise classification F1 via cluster membership: two documents
+are predicted similar if they share the same K-Means cluster label. Ground-truth positives
+are pairs with LLM-judge score ∈ {1, 2, 3}; negatives use scores ∈ {5, 6, 7} (scores 4
+and 8 are excluded). Best K is selected on the training split only; the test split is held
+out until after K is chosen to prevent label leakage. See `src/evaluate.py`.
 
 ---
 
@@ -223,10 +231,18 @@ produced by the model are semantically coherent.
 ```bash
 pip install -r requirements.txt
 python src/generate_mock_data.py
-# → data/mock_pairs.jsonl (100 synthetic statute pairs)
+# → data/mock_pairs.jsonl (~200 anchor-centric statute pairs)
+# Each anchor has both positives (score 1–3) and negatives (score 5–7)
+# so that triplet construction produces non-zero training examples.
 ```
 
-**2. Fine-tune on mock triplets**:
+**2. Run the smoke tests** (no GPU or model download required):
+
+```bash
+pytest tests/ -v -k "not slow"
+```
+
+**3. Fine-tune on mock triplets**:
 
 ```bash
 python src/train.py \
@@ -236,7 +252,7 @@ python src/train.py \
   --batch-size 4
 ```
 
-**3. Extract embeddings and cluster**:
+**4. Extract embeddings and cluster**:
 
 ```bash
 python src/inference.py \
@@ -245,6 +261,16 @@ python src/inference.py \
   --shard 0 --n-shards 1
 
 python src/cluster.py   # end-to-end mock run with random embeddings
+```
+
+**5. Baseline vs. fine-tuned experiment (synthetic demo)**:
+
+```bash
+python src/experiment.py \
+  --pairs  data/mock_pairs.jsonl \
+  --output runs/experiment \
+  --epochs 2
+# Note: results are from synthetic data; see Performance section above.
 ```
 
 **HPC (full corpus)** — submit the SLURM array job:
@@ -270,12 +296,20 @@ finetune_example/
 │   ├── mock_pairs.jsonl        ← Synthetic statute pairs (generated)
 │   └── mock_config.json        ← Sampling & training hyperparameters
 │
+├── tests/
+│   ├── test_triplets.py        ← Triplet construction (zero-triplets regression)
+│   ├── test_metrics.py         ← Pairwise F1 metric correctness
+│   ├── test_gradient.py        ← Gradient flow verification (slow, requires model)
+│   └── test_smoke.py           ← End-to-end pipeline smoke tests
+│
 └── src/
     ├── generate_mock_data.py   ← Self-contained mock data generator
     ├── data_pipeline.py        ← BM25 mining + async LLM-as-judge scorer
     ├── train.py                ← Qwen3-0.6B contrastive triplet training
     ├── inference.py            ← Shard-based embedding extraction
-    └── cluster.py              ← FAISS K-Means + HDBSCAN + PCA/UMAP
+    ├── cluster.py              ← FAISS K-Means + HDBSCAN + PCA/UMAP
+    ├── evaluate.py             ← Pairwise classification F1 (K sweep, train/test split)
+    └── experiment.py           ← Synthetic baseline vs. fine-tuned demo
 ```
 
 ---

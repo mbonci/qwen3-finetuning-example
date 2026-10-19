@@ -26,7 +26,6 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
-from sklearn.metrics import f1_score
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -255,33 +254,51 @@ def evaluate_clusters(
     embeddings: np.ndarray,
     labels: np.ndarray,
     known_pairs_df: pd.DataFrame,
+    doc_ids: list[str] | None = None,
     threshold: float = 0.5,
 ) -> ClusterEvalResult:
-    """Compute clustering F1 on known similar pairs.
+    """Compute pairwise classification F1 via cluster membership on known pairs.
 
-    Two documents are predicted as similar if they share the same cluster label.
-    Ground truth positives are pairs with similarity_score ∈ {1, 2, 3}.
+    Two documents are predicted similar if they share the same cluster label.
+    Ground truth positives are pairs with similarity_score ∈ {1, 2, 3};
+    negatives are pairs with score ∈ {5, 6, 7} (scores 4 and 8 are excluded).
 
-    This is the metric used to measure the +0.20 clustering F1 improvement
-    from fine-tuning Qwen3-Embedding-0.6B vs. the base model.
+    This is the metric used to report the +0.20 improvement from fine-tuning:
+    pairwise classification F1 (not generic cluster quality), measured on a
+    held-out validation set of labeled pairs from the proprietary corpus.
 
     Parameters
     ----------
     embeddings:     Float32 array of shape (n_docs, dim)
-    labels:         Cluster label per document (shape n_docs,)
-    known_pairs_df: DataFrame with anchor_id, candidate_id, similarity_score,
-                    and an integer index aligned with embeddings
-    threshold:      Cosine similarity threshold (used as fallback if label-based
-                    F1 is degenerate — all docs in one cluster)
+    labels:         Cluster label per document (shape n_docs,); aligned with embeddings
+    known_pairs_df: DataFrame with anchor_id, candidate_id, similarity_score columns
+    doc_ids:        Ordered list of document IDs corresponding to rows of embeddings.
+                    Required to correctly map anchor_id/candidate_id → label index.
+                    If None, the DataFrame's integer index is used (legacy behaviour).
+    threshold:      Retained for API compatibility; not used in cluster-membership eval.
     """
     POSITIVE_SCORES = {1, 2, 3}
+    NEGATIVE_SCORES = {5, 6, 7}
+
     df = known_pairs_df.dropna(subset=["similarity_score"]).copy()
     df["similarity_score"] = df["similarity_score"].astype(int)
+    # Restrict to clearly labeled pairs; exclude boundary scores 4 and 8
+    df = df[df["similarity_score"].isin(POSITIVE_SCORES | NEGATIVE_SCORES)]
 
-    id_to_idx = {doc_id: i for i, doc_id in enumerate(df["anchor_id"].tolist() + df["candidate_id"].tolist())}
+    if doc_ids is not None:
+        id_to_idx: dict[str, int] = {doc_id: i for i, doc_id in enumerate(doc_ids)}
+    else:
+        # Legacy: positional index built from DataFrame — only correct when the
+        # DataFrame's integer index happens to match the embeddings row order.
+        all_ids = df["anchor_id"].tolist() + df["candidate_id"].tolist()
+        seen: dict[str, int] = {}
+        for doc_id in all_ids:
+            if doc_id not in seen:
+                seen[doc_id] = len(seen)
+        id_to_idx = seen
 
-    y_true = []
-    y_pred = []
+    y_true: list[int] = []
+    y_pred: list[int] = []
     for _, row in df.iterrows():
         a_idx = id_to_idx.get(row["anchor_id"])
         b_idx = id_to_idx.get(row["candidate_id"])
@@ -296,11 +313,12 @@ def evaluate_clusters(
         logger.warning("No evaluable pairs found — returning zero F1")
         return ClusterEvalResult(f1=0.0, precision=0.0, recall=0.0, n_pairs_evaluated=0, threshold=threshold)
 
-    f1 = float(f1_score(y_true, y_pred, zero_division=0))
-    precision = float(f1_score(y_true, y_pred, zero_division=0, average="binary"))
     tp = sum(p == 1 and t == 1 for p, t in zip(y_pred, y_true))
+    fp = sum(p == 1 and t == 0 for p, t in zip(y_pred, y_true))
     fn = sum(p == 0 and t == 1 for p, t in zip(y_pred, y_true))
+    precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-9)
 
     logger.info(
         "Cluster eval: F1=%.4f  P=%.4f  R=%.4f  n=%d",

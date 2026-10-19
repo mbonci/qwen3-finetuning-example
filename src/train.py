@@ -7,9 +7,9 @@ Training pipeline:
   1. Load Qwen3-Embedding-0.6B (or a previously fine-tuned checkpoint)
   2. Construct triplets on-the-fly from a scored pairwise dataset using transitive
      inference and hard-negative selection by cosine rank
-  3. Train with cosine-distance triplet loss (margin = 0.3)
+  3. Train with cosine-distance triplet loss (margin = 0.3) via SentenceTransformerTrainer
   4. Evaluate per-topic binary F1 on a held-out validation set
-  5. Save the best checkpoint and a cosine distribution visualisation
+  5. Save the best checkpoint
 
 Usage (local / mock):
     python src/train.py --triplets data/mock_pairs.jsonl --output runs/test --epochs 1
@@ -27,14 +27,8 @@ import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
-import pandas as pd
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -55,60 +49,29 @@ class TrainConfig:
     warmup_ratio: float = 0.1
     max_seq_length: int = 512
     triplet_margin: float = 0.3
-    distance_metric: str = "cosine"
     max_positives_per_anchor: int = 2
     max_negatives_per_anchor: int = 3
-    eval_steps: int = 500
-    save_steps: int = 1000
     seed: int = 42
     # Set automatically from SLURM_ARRAY_TASK_ID if running on HPC
     task_id: int = field(default_factory=lambda: int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
 
 
 # ---------------------------------------------------------------------------
-# Triplet Loss
+# Dataset (triplet construction only — training is handled by the Trainer)
 # ---------------------------------------------------------------------------
 
-class TripletLoss(torch.nn.Module):
-    """Cosine- or Euclidean-distance triplet loss with configurable margin.
-
-    L(a, p, n) = max(0, d(a, p) − d(a, n) + margin)
-    """
-
-    def __init__(self, margin: float = 0.3, distance: str = "cosine"):
-        super().__init__()
-        self.margin = margin
-        self.distance = distance
-
-    def _dist(self, x: Tensor, y: Tensor) -> Tensor:
-        if self.distance == "cosine":
-            return 1.0 - F.cosine_similarity(x, y, dim=1)
-        return torch.norm(x - y, dim=1)
-
-    def forward(self, anchor: Tensor, positive: Tensor, negative: Tensor) -> Tensor:
-        d_pos = self._dist(anchor, positive)
-        d_neg = self._dist(anchor, negative)
-        loss = F.relu(d_pos - d_neg + self.margin)
-        return loss.mean()
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class TripletDatasetFromPairs(Dataset):
-    """Constructs triplets on-the-fly from a scored pairwise JSONL/parquet file.
+class TripletDatasetFromPairs:
+    """Constructs triplets from a scored pairwise JSONL/parquet file.
 
     Triplet construction strategy:
     - For each anchor with at least one positive and one negative, pair each
-      positive with hard negatives ranked by descending cosine similarity (i.e.
-      the most confusable negatives come first).
+      positive with hard negatives ranked by descending cosine similarity.
     - Transitive inference: if (A,B) is positive, B's positives are also treated
       as indirect positives of A for augmentation.
     """
 
     POSITIVE_SCORES = {1, 2, 3}
-    NEGATIVE_SCORES = {4, 5, 6, 7}
+    NEGATIVE_SCORES = {5, 6, 7}
 
     def __init__(
         self,
@@ -118,6 +81,8 @@ class TripletDatasetFromPairs(Dataset):
         augment_transitive: bool = True,
         seed: int = 42,
     ):
+        import pandas as pd
+
         self.rng = random.Random(seed)
         pairs = self._load(Path(path))
         self.triplets = self._build_triplets(pairs, max_positives, max_negatives, augment_transitive)
@@ -125,6 +90,8 @@ class TripletDatasetFromPairs(Dataset):
 
     @staticmethod
     def _load(path: Path) -> list[dict]:
+        import pandas as pd
+
         if path.suffix == ".jsonl":
             with path.open() as f:
                 return [json.loads(line) for line in f if line.strip()]
@@ -136,7 +103,7 @@ class TripletDatasetFromPairs(Dataset):
         max_positives: int,
         max_negatives: int,
         augment_transitive: bool,
-    ) -> list[tuple[str, str, str, str, str, str]]:
+    ) -> list[tuple[str, str, str]]:
         positives: dict[str, list[tuple[str, str, float]]] = {}
         negatives: dict[str, list[tuple[str, str, float]]] = {}
         text_lookup: dict[str, str] = {}
@@ -170,14 +137,15 @@ class TripletDatasetFromPairs(Dataset):
                         pos_list.append(item)
                         existing_ids.add(item[0])
 
-        triplets = []
-        for anchor in sorted(set(positives.keys()) & set(negatives.keys())):
+        triplets: list[tuple[str, str, str]] = []
+        eligible = sorted(set(positives.keys()) & set(negatives.keys()))
+        for anchor in eligible:
             ta = text_lookup.get(anchor, "")
             pos_sorted = positives[anchor][:max_positives]
             neg_sorted = sorted(negatives[anchor], key=lambda x: x[2], reverse=True)[:max_negatives]
-            for pos_id, tp, _ in pos_sorted:
-                for neg_id, tn, _ in neg_sorted:
-                    triplets.append((anchor, pos_id, neg_id, ta, tp, tn))
+            for _, tp, _ in pos_sorted:
+                for _, tn, _ in neg_sorted:
+                    triplets.append((ta, tp, tn))
 
         self.rng.shuffle(triplets)
         return triplets
@@ -186,8 +154,7 @@ class TripletDatasetFromPairs(Dataset):
         return len(self.triplets)
 
     def __getitem__(self, idx: int) -> tuple[str, str, str]:
-        anchor_id, pos_id, neg_id, ta, tp, tn = self.triplets[idx]
-        return ta, tp, tn
+        return self.triplets[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +166,21 @@ class BinaryClassificationEvaluatorPrimaryF1:
 
     A pair is predicted positive if cosine_similarity ≥ threshold (0.5 default).
     Reports macro-averaged F1 across topics and an overall F1.
+
+    Uses model.encode() which is correct here — evaluation does not require gradients.
     """
 
     POSITIVE_SCORES = {1, 2, 3}
 
-    def __init__(self, val_pairs: list[dict], threshold: float = 0.5):
+    def __init__(self, val_pairs: list[dict], threshold: float = 0.5, name: str = "eval"):
         self.val_pairs = val_pairs
         self.threshold = threshold
+        self.name = name
 
-    def __call__(self, model, output_path: Optional[str] = None) -> float:
+    def __call__(self, model, output_path: str | None = None, epoch: int = -1, steps: int = -1) -> float:
+        import torch
+        import torch.nn.functional as F
+
         texts_a = [p["text_a"] for p in self.val_pairs]
         texts_b = [p["text_b"] for p in self.val_pairs]
         labels = [1 if int(p["similarity_score"]) in self.POSITIVE_SCORES else 0 for p in self.val_pairs]
@@ -239,16 +212,7 @@ class BinaryClassificationEvaluatorPrimaryF1:
 
 
 # ---------------------------------------------------------------------------
-# Collator
-# ---------------------------------------------------------------------------
-
-def _collate_fn(batch: list[tuple[str, str, str]]) -> tuple[list[str], list[str], list[str]]:
-    anchors, positives, negatives = zip(*batch)
-    return list(anchors), list(positives), list(negatives)
-
-
-# ---------------------------------------------------------------------------
-# Training Loop
+# Training
 # ---------------------------------------------------------------------------
 
 def train(cfg: TrainConfig) -> None:
@@ -257,9 +221,16 @@ def train(cfg: TrainConfig) -> None:
     random.seed(cfg.seed)
 
     try:
+        import torch
         from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+        from sentence_transformers.losses import TripletLoss as STTripletLoss, TripletDistanceMetric
+        from datasets import Dataset as HFDataset
     except ImportError as exc:
-        raise ImportError("sentence-transformers is required: pip install sentence-transformers") from exc
+        raise ImportError(
+            "sentence-transformers>=3.0 and datasets are required: "
+            "pip install 'sentence-transformers>=3.0' datasets"
+        ) from exc
 
     output_dir = Path(cfg.output_dir) / f"task_{cfg.task_id:02d}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -268,68 +239,59 @@ def train(cfg: TrainConfig) -> None:
     model = SentenceTransformer(cfg.model_name, trust_remote_code=True)
     model.max_seq_length = cfg.max_seq_length
 
-    dataset = TripletDatasetFromPairs(
+    triplet_ds = TripletDatasetFromPairs(
         cfg.triplets_path,
         max_positives=cfg.max_positives_per_anchor,
         max_negatives=cfg.max_negatives_per_anchor,
         seed=cfg.seed,
     )
+    if len(triplet_ds) == 0:
+        raise ValueError(
+            f"No triplets could be constructed from {cfg.triplets_path}. "
+            "Ensure the data has anchor-centric pairs where the same anchor_id "
+            "appears in both positive (score 1–3) and negative (score 5–7) rows."
+        )
 
-    dataloader = DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=_collate_fn, drop_last=True
+    anchors, positives, negatives = zip(*[triplet_ds[i] for i in range(len(triplet_ds))])
+    train_dataset = HFDataset.from_dict({
+        "anchor": list(anchors),
+        "positive": list(positives),
+        "negative": list(negatives),
+    })
+    logger.info("Training dataset: %d triplets", len(train_dataset))
+
+    loss = STTripletLoss(
+        model=model,
+        distance_metric=TripletDistanceMetric.COSINE,
+        triplet_margin=cfg.triplet_margin,
     )
 
-    loss_fn = TripletLoss(margin=cfg.triplet_margin, distance=cfg.distance_metric)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
-    total_steps = len(dataloader) * cfg.epochs
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
-
-    try:
-        from transformers import get_linear_schedule_with_warmup
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    except ImportError:
-        scheduler = None
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    logger.info("Training on %s | triplets=%d | steps=%d", device, len(dataset), total_steps)
-
-    best_f1 = 0.0
-    global_step = 0
-
-    for epoch in range(cfg.epochs):
-        model.train()
-        epoch_loss = 0.0
-
-        for batch_idx, (anchors, positives, negatives) in enumerate(dataloader):
-            emb_a = model.encode(anchors, convert_to_tensor=True, normalize_embeddings=True)
-            emb_p = model.encode(positives, convert_to_tensor=True, normalize_embeddings=True)
-            emb_n = model.encode(negatives, convert_to_tensor=True, normalize_embeddings=True)
-
-            optimizer.zero_grad()
-            loss = loss_fn(emb_a, emb_p, emb_n)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            if scheduler:
-                scheduler.step()
-
-            epoch_loss += loss.item()
-            global_step += 1
-
-            if global_step % 100 == 0:
-                logger.info("Epoch %d | step %d | loss %.4f", epoch + 1, global_step, loss.item())
-
-        logger.info("Epoch %d complete | avg loss %.4f", epoch + 1, epoch_loss / max(len(dataloader), 1))
-
-        ckpt_path = output_dir / f"checkpoint_epoch_{epoch + 1}"
-        model.save(str(ckpt_path))
-        logger.info("Checkpoint saved: %s", ckpt_path)
-
-    logger.info("Training complete. Best F1: %.4f", best_f1)
-    (output_dir / "config.json").write_text(
-        json.dumps(cfg.__dict__, default=str, indent=2)
+    train_args = SentenceTransformerTrainingArguments(
+        output_dir=str(output_dir),
+        num_train_epochs=cfg.epochs,
+        per_device_train_batch_size=cfg.batch_size,
+        learning_rate=cfg.learning_rate,
+        warmup_ratio=cfg.warmup_ratio,
+        eval_strategy="no",
+        save_strategy="epoch",
+        seed=cfg.seed,
+        logging_steps=50,
     )
+
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_dataset,
+        loss=loss,
+    )
+
+    logger.info("Starting training | triplets=%d | epochs=%d", len(train_dataset), cfg.epochs)
+    trainer.train()
+
+    final_path = output_dir / "final"
+    model.save_pretrained(str(final_path))
+    logger.info("Training complete. Final model saved to %s", final_path)
+    (output_dir / "config.json").write_text(json.dumps(cfg.__dict__, default=str, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
+    import torch
     args = build_parser().parse_args()
     cfg = TrainConfig(
         model_name=args.model,

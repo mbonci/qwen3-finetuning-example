@@ -1,6 +1,7 @@
 sentence-transformers>=3.0,<4.0
 transformers>=4.40,<5.0
 torch>=2.2
+datasets>=2.12
 faiss-cpu>=1.7
 hdbscan>=0.8
 umap-learn>=0.5
@@ -11,3 +12,4 @@ pandas>=2.0
 numpy>=1.24,<2.0
 scikit-learn>=1.4
 tqdm>=4.65
+pytest>=7.0
