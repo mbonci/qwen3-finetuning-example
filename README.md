@@ -137,9 +137,7 @@ Per-topic percentile bins (thresholds computed within each topic):
   q40_60 | q60_80 | q80_90 | q90_95 | q95_100
   Pairs below 40th percentile of their topic → excluded
 
-Stratified sample → 100K pairs:
-  strata = BM25 × 5 bins + random × 5 bins (10 total)
-  weights peak at BM25 q80_90 (0.18) and q90_95 (0.16)
+Stratified sample → 100K pairs across 10 strata (BM25 × 5 bins + random × 5 bins)
 ```
 
 Key design decisions:
