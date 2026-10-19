@@ -5,7 +5,7 @@ datasets>=2.12
 faiss-cpu>=1.7
 hdbscan>=0.8
 umap-learn>=0.5
-rank_bm25>=0.2
+bm25s
 openai>=1.0
 pyarrow>=14
 pandas>=2.0

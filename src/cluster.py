@@ -2,15 +2,14 @@
 
 Two independent clustering approaches are exposed as top-level pipelines:
 
-  pipeline_kmeans()   — PCA → UMAP (optional) → FAISS K-Means
-      Exhaustive partition (every document is assigned a cluster).
-      Scales to 8M+ documents via FAISS GPU acceleration.
-      UMAP can be skipped when embeddings are already low-dimensional.
+  pipeline_kmeans()   — FAISS K-Means directly on raw embeddings (no PCA/UMAP)
+      Exhaustive partition. Scales to 8M+ docs via FAISS GPU. K swept per topic;
+      best K selected by silhouette score.
 
-  pipeline_hdbscan()  — PCA → UMAP → HDBSCAN
-      Density-based; finds clusters of arbitrary shape and size.
-      Labels noise points as -1 (documents that don't belong to any cluster).
-      UMAP is required — HDBSCAN degrades significantly above ~64 dimensions.
+  pipeline_hdbscan()  — PCA (→50d) → UMAP (→5d) → HDBSCAN
+      Density-based; finds irregular-shaped clusters. UMAP is required — HDBSCAN
+      degrades above ~10–20 dimensions. Noise points (-1) are reassigned to their
+      nearest cluster centroid so the output is an exhaustive partition too.
 
 Both pipelines share the same dim-reduction primitives (reduce_pca, reduce_umap)
 and the same evaluate_clusters() metric.
@@ -22,7 +21,7 @@ Usage (library):
     from src.cluster import pipeline_kmeans, pipeline_hdbscan, evaluate_clusters
 
     km  = pipeline_kmeans(embeddings, n_clusters=150)
-    hdb = pipeline_hdbscan(embeddings, min_cluster_size=50)
+    hdb = pipeline_hdbscan(embeddings, min_cluster_size=15)
 
     f1_km  = evaluate_clusters(embeddings, km.labels,  val_pairs_df, doc_ids=ids)
     f1_hdb = evaluate_clusters(embeddings, hdb.labels, val_pairs_df, doc_ids=ids)
@@ -59,6 +58,7 @@ class HDBSCANResult:
     cluster_sizes: dict[int, int]
     n_clusters: int
     noise_fraction: float
+    n_noise_reassigned: int = 0
 
 
 @dataclass
@@ -140,6 +140,36 @@ def reduce_dimensions(
     return reduced
 
 
+def _assign_noise_to_nearest_centroid(
+    labels: np.ndarray,
+    embeddings: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Reassign noise points (-1) to the nearest cluster centroid.
+
+    Centroids are the mean of all non-noise points in each cluster, computed
+    in the embedding space passed in (typically the UMAP output).
+    Returns (filled_labels, n_reassigned).
+    """
+    mask_noise = labels == -1
+    n_noise = int(mask_noise.sum())
+    if n_noise == 0:
+        return labels.copy(), 0
+
+    from scipy.spatial.distance import cdist
+
+    mask_core = ~mask_noise
+    centroid_labels = np.unique(labels[mask_core])
+    centroids = np.vstack([
+        embeddings[labels == c].mean(axis=0) for c in centroid_labels
+    ])
+    dists = cdist(embeddings[mask_noise], centroids)
+    nearest = centroid_labels[dists.argmin(axis=1)]
+
+    filled = labels.copy()
+    filled[mask_noise] = nearest
+    return filled, n_noise
+
+
 # ---------------------------------------------------------------------------
 # Stage 2a: FAISS K-Means
 # ---------------------------------------------------------------------------
@@ -217,7 +247,7 @@ def cluster_kmeans(
 def cluster_hdbscan(
     embeddings: np.ndarray,
     min_cluster_size: int = 50,
-    min_samples: int = 10,
+    min_samples: int | None = None,
     metric: str = "euclidean",
     cluster_selection_method: str = "eom",
 ) -> HDBSCANResult:
@@ -271,52 +301,28 @@ def cluster_hdbscan(
 
 def pipeline_kmeans(
     embeddings: np.ndarray,
-    pca_dim: int = 256,
-    umap_dim: int | None = 64,
     n_clusters: int = 150,
     n_iter: int = 25,
     n_redo: int = 3,
     use_gpu: bool = False,
-    random_state: int = 42,
 ) -> KMeansResult:
-    """Full pipeline: PCA → (optional UMAP) → FAISS K-Means.
+    """FAISS K-Means directly on raw embeddings — no PCA or UMAP.
 
-    UMAP is skipped when umap_dim is None or umap-learn is not installed.
-    This makes the pipeline usable on any machine; UMAP is a performance
-    optimisation for high-dimensional inputs, not a correctness requirement.
-
-    At 8M-document scale, FAISS K-Means with use_gpu=True finishes in minutes
-    vs. hours for sklearn; results in a fixed-size exhaustive partition
-    (every document is assigned to exactly one cluster).
+    K-Means does not require dimensionality reduction: it operates directly
+    in the embedding space where the distances are already meaningful. At
+    8M-document scale, FAISS GPU acceleration makes this fast without PCA/UMAP.
+    K is swept per topic with silhouette score to select the best partition.
 
     Parameters
     ----------
-    embeddings:   Float32 array of shape (n_docs, embedding_dim)
-    pca_dim:      PCA target; set to None to skip PCA
-    umap_dim:     UMAP target; set to None to skip UMAP
-    n_clusters:   K for K-Means
-    n_iter:       K-Means iterations
-    n_redo:       Independent restarts (best inertia kept)
-    use_gpu:      Use FAISS GPU index if available
-    random_state: Seed for PCA and UMAP
+    embeddings:  Float32 array of shape (n_docs, embedding_dim)
+    n_clusters:  K for K-Means
+    n_iter:      K-Means iterations
+    n_redo:      Independent restarts (best inertia kept)
+    use_gpu:     Use FAISS GPU index if available
     """
-    logger.info("Pipeline K-Means: %d docs × %d dims", *embeddings.shape)
-    reduced = embeddings
-
-    if pca_dim is not None:
-        reduced = reduce_pca(reduced, n_components=pca_dim, random_state=random_state)
-
-    if umap_dim is not None:
-        try:
-            reduced = reduce_umap(
-                reduced,
-                n_components=umap_dim,
-                random_state=random_state,
-            )
-        except ImportError:
-            logger.warning("umap-learn not installed — skipping UMAP for K-Means pipeline")
-
-    return cluster_kmeans(reduced, n_clusters=n_clusters, n_iter=n_iter,
+    logger.info("Pipeline K-Means: %d docs × %d dims (no dim reduction)", *embeddings.shape)
+    return cluster_kmeans(embeddings, n_clusters=n_clusters, n_iter=n_iter,
                           n_redo=n_redo, use_gpu=use_gpu)
 
 
@@ -326,53 +332,64 @@ def pipeline_kmeans(
 
 def pipeline_hdbscan(
     embeddings: np.ndarray,
-    pca_dim: int = 256,
-    umap_dim: int = 64,
+    pca_dim: int = 50,
+    umap_dim: int = 5,
     umap_n_neighbors: int = 15,
     umap_min_dist: float = 0.0,
-    min_cluster_size: int = 50,
-    min_samples: int = 10,
+    min_cluster_size: int = 15,
+    min_samples: int | None = None,
     cluster_selection_method: str = "eom",
     random_state: int = 42,
 ) -> HDBSCANResult:
-    """Full pipeline: PCA → UMAP → HDBSCAN.
+    """Full pipeline: PCA (→50d) → UMAP (→5d) → HDBSCAN → noise reassignment.
 
-    UMAP is required here, not optional: HDBSCAN's distance computations become
-    unreliable above ~64 dimensions (curse of dimensionality), and the algorithm
-    does not scale to 1024-dimensional inputs. The default umap_min_dist=0.0
-    produces tighter local structure than the K-Means pipeline (0.1), which
-    helps HDBSCAN resolve cluster boundaries at low dimensionality.
+    UMAP is required — HDBSCAN degrades significantly above ~20 dimensions.
+    PCA to 50d before UMAP is much cheaper than running UMAP on 1024d inputs.
+    umap_min_dist=0.0 (default) produces tight local structure that helps
+    HDBSCAN resolve boundaries; contrast with pipeline_kmeans which doesn't
+    use UMAP at all.
 
-    Documents that don't belong to any cluster are labelled -1 (noise).
-    This is a feature, not a bug: it lets the pipeline surface coherent semantic
-    groups without forcing every document into one.
+    Noise points (-1) are reassigned to their nearest cluster centroid so the
+    final output is an exhaustive partition (same contract as pipeline_kmeans).
 
     Parameters
     ----------
     embeddings:               Float32 array of shape (n_docs, embedding_dim)
-    pca_dim:                  PCA target before UMAP
-    umap_dim:                 UMAP target (keep ≤ 64 for HDBSCAN to work well)
+    pca_dim:                  PCA target before UMAP (50 matches proprietary pipeline)
+    umap_dim:                 UMAP target (5 matches proprietary pipeline)
     umap_n_neighbors:         UMAP neighborhood size
     umap_min_dist:            UMAP min_dist; 0.0 gives tighter cluster cores
-    min_cluster_size:         Minimum points to form a cluster
-    min_samples:              HDBSCAN core-distance parameter
+    min_cluster_size:         Minimum points to form a cluster (15 in production)
+    min_samples:              HDBSCAN core-distance; None → uses min_cluster_size
     cluster_selection_method: 'eom' (excess of mass) or 'leaf'
     random_state:             Seed for PCA and UMAP
     """
     logger.info("Pipeline HDBSCAN: %d docs × %d dims", *embeddings.shape)
     reduced = reduce_pca(embeddings, n_components=pca_dim, random_state=random_state)
-    reduced = reduce_umap(
+    reduced_umap = reduce_umap(
         reduced,
         n_components=umap_dim,
         n_neighbors=umap_n_neighbors,
         min_dist=umap_min_dist,
+        metric="cosine",
         random_state=random_state,
     )
-    return cluster_hdbscan(
-        reduced,
+    result = cluster_hdbscan(
+        reduced_umap,
         min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
+        min_samples=min_samples if min_samples is not None else min_cluster_size,
         cluster_selection_method=cluster_selection_method,
+    )
+    filled_labels, n_reassigned = _assign_noise_to_nearest_centroid(result.labels, reduced_umap)
+    if n_reassigned > 0:
+        logger.info("HDBSCAN noise reassignment: %d points reassigned", n_reassigned)
+    return HDBSCANResult(
+        labels=filled_labels,
+        cluster_sizes={int(l): int((filled_labels == l).sum())
+                       for l in sorted(set(filled_labels))},
+        n_clusters=result.n_clusters,
+        noise_fraction=result.noise_fraction,
+        n_noise_reassigned=n_reassigned,
     )
 
 
@@ -480,7 +497,7 @@ def _mock_run() -> None:
 
     # --- Approach 1: FAISS K-Means ---
     logger.info("=== Approach 1: FAISS K-Means ===")
-    km = pipeline_kmeans(embeddings, pca_dim=64, umap_dim=16, n_clusters=20)
+    km = pipeline_kmeans(embeddings, n_clusters=20)
     logger.info("K-Means: inertia=%.2f, clusters=%d", km.inertia, len(set(km.labels)))
     km_eval = evaluate_clusters(embeddings, km.labels, mock_pairs, doc_ids=doc_ids)
     logger.info("K-Means eval: F1=%.4f  P=%.4f  R=%.4f", km_eval.f1, km_eval.precision, km_eval.recall)
@@ -488,7 +505,7 @@ def _mock_run() -> None:
     # --- Approach 2: Dim-reduced HDBSCAN ---
     logger.info("=== Approach 2: HDBSCAN ===")
     try:
-        hdb = pipeline_hdbscan(embeddings, pca_dim=64, umap_dim=16, min_cluster_size=10, min_samples=3)
+        hdb = pipeline_hdbscan(embeddings, pca_dim=16, umap_dim=5, min_cluster_size=10, min_samples=3)
         logger.info(
             "HDBSCAN: %d clusters, %.1f%% noise",
             hdb.n_clusters, hdb.noise_fraction * 100,

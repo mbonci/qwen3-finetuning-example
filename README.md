@@ -40,20 +40,24 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   │  Stage 1 — Contrastive Pair Mining                  src/data_pipeline.py │
   │                                                                          │
   │  ┌─────────────────────────┐   ┌──────────────────────────────────────┐  │
-  │  │  BM25 Hard-Negative     │   │  Random Within-Topic Sampling        │  │
-  │  │  Mining                 │   │                                      │  │
-  │  │  • Build BM25 index     │   │  • 2.5M random within-topic pairs    │  │
-  │  │    per topic            │   │  • Enforce different-state pairs     │  │
-  │  │  • Sample 5% anchors    │   │  • Deduplication (order-invariant)   │  │
-  │  │  • Retrieve top-100     │   │                                      │  │
-  │  │    per anchor           │   └──────────────────────────────────────┘  │
+  │  │  BM25 (bm25s) Mining    │   │  Random Within-Topic Sampling        │  │
+  │  │                         │   │                                      │  │
+  │  │  • One index per topic  │   │  • 2.5M random within-topic pairs    │  │
+  │  │  • 5% anchors per topic │   │  • Different-state pairs only        │  │
+  │  │    (floor: 1K/topic)    │   │  • Deduplication (order-invariant)   │  │
+  │  │  • Top-100 per anchor   │   │                                      │  │
+  │  │  • Different-state only │   └──────────────────────────────────────┘  │
   │  └────────────┬────────────┘                         │                   │
-  │               └───────────────── 80% / 20% ─────────┘                   │
+  │               └──── merge + deduplicate (BM25 priority) ────────────────┘│
+  │                        Within-topic rebalancing (cap at median count)     │
   │                                        │                                 │
   │                                        ▼                                 │
-  │                        Cosine Similarity Binning                         │
-  │                   q40-60 | q60-80 | q80-90 | q90-95 | q95-100           │
-  │                        Stratified sample → 100K pairs                    │
+  │               Per-topic percentile cosine bins (q40–q95)                 │
+  │               Pairs below 40th percentile of topic → excluded            │
+  │                                        │                                 │
+  │                    Stratified sampling from 10 strata → 100K pairs       │
+  │           BM25 × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
+  │         Random × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
   └──────────────────────────────────┬───────────────────────────────────────┘
                                      │
                                      ▼
@@ -99,13 +103,13 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  Stage 5 — Semantic Clustering                           src/cluster.py  │
   │                                                                          │
-  │  Approach 1 — FAISS K-Means                                              │
-  │    PCA (1024d → 256d)  →  UMAP (256d → 64d)  →  FAISS K-Means (K=150)  │
-  │    Exhaustive partition; every document assigned to a cluster             │
+  │  Approach 1 — FAISS K-Means (no dim reduction)                           │
+  │    Raw 1024d embeddings  →  FAISS K-Means, K swept per topic             │
+  │    Best K selected by silhouette score; exhaustive partition              │
   │                                                                           │
   │  Approach 2 — Dim-reduced HDBSCAN                                        │
-  │    PCA (1024d → 256d)  →  UMAP (256d → 64d, min_dist=0.0)               │
-  │    → HDBSCAN (min_cluster=50)  — noise points labelled -1                │
+  │    PCA (1024d → 50d)  →  UMAP (50d → 5d, min_dist=0.0, metric=cosine)   │
+  │    → HDBSCAN (min_cluster=15)  → noise reassigned to nearest centroid    │
   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -113,27 +117,38 @@ This repository implements a **mock data strategy** that faithfully mimics the p
 
 ## 🔬 Architecture Deep Dive
 
-### 1. Hard-Negative Mining with BM25
+### 1. Contrastive Pair Mining
 
-Naïve random sampling for contrastive learning produces easy negatives that carry
-weak training signal. The pipeline mines **hard negatives** — statutes that are
-lexically similar but semantically distinct — by building a BM25 index per topic
-and retrieving the top-100 candidates for each sampled anchor.
+Naïve random sampling produces easy negatives that carry weak training signal.
+The pipeline mines **hard negatives** — statutes that are lexically similar but
+semantically distinct — using `bm25s` BM25 retrieval per topic.
 
 ```
 For each topic domain T:
-  anchors ← sample(members_T, frac=0.05)
-  For each anchor a:
-    candidates ← bm25_index_T.top_k(a, k=100)
-    cosine_scores ← embed(candidates) · embed(a)
-    assign to bin: q40-60 | q60-80 | q80-90 | q90-95 | q95-100
+  anchors ← sample(members_T, frac=max(0.05, floor=1000))
+  For each anchor a (different-state pairs only):
+    candidates ← bm25s_index_T.top_k(a, k=100)
 
-Merge BM25 (80%) + random (20%) → stratified sample → 100K pairs
+2.5M random within-topic pairs (different-state only)
+
+Merge + deduplicate (BM25 priority)
+Within-topic rebalancing: cap each topic at median(topic_counts)
+
+cosine_scores ← base_model.encode(all_pairs)
+Per-topic percentile bins (thresholds computed within each topic):
+  q40_60 | q60_80 | q80_90 | q90_95 | q95_100
+  Pairs below 40th percentile of their topic → excluded
+
+Stratified sample → 100K pairs:
+  strata = BM25 × 5 bins + random × 5 bins (10 total)
+  weights concentrate on q80_90, q90_95, q95_100 (hard boundary cases)
 ```
 
-Cosine quantile bins ensure the training set is **balanced across the decision
-boundary**: the model sees pairs at every difficulty level, not just easy
-positives and random negatives.
+Key design decisions:
+- **Same-state exclusion**: pairs from the same US state are discarded — cross-state pairs test generalisation rather than near-duplicate matching
+- **Per-topic percentile bins**: thresholds are computed within each topic so the bin boundaries reflect each topic's distribution, not a global absolute threshold
+- **Within-topic rebalancing**: capping each topic at the median count prevents large topics (e.g. Government Operations, ~1.7M statutes) from dominating the training signal
+- **Stratified weight matrix**: higher cosine bins (q80_90 and above) receive more weight — these pairs sit near the positive/negative decision boundary and carry the most useful gradient signal
 
 ---
 
@@ -182,28 +197,28 @@ embedding matrix:
 
 **Approach 1 — FAISS K-Means** (`pipeline_kmeans`):
 ```
-1024d (Qwen3)  →[PCA]→  256d  →[UMAP]→  64d  →[FAISS K-Means]→  K=150 groups
+Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
+                          Best K selected by silhouette score
 ```
-- Produces an **exhaustive partition**: every document is assigned exactly one cluster
-- UMAP is optional — can be skipped when embeddings are already low-dimensional
-- FAISS K-Means with GPU acceleration runs on the full 8M matrix in minutes vs. hours for sklearn
-- Best K is selected on the training split only (see `src/evaluate.py`)
+- **No dimensionality reduction**: K-Means operates directly on the 1024d Qwen3 embeddings; the distances are already meaningful in that space
+- Run **per topic domain** — one K-Means per primary policy topic; K is swept over `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]` and the best K is selected by silhouette score
+- FAISS K-Means with GPU acceleration handles each topic in seconds; sklearn fallback for small topics (<2000 statutes)
+- Exhaustive partition: every document is assigned to exactly one cluster
 
 **Approach 2 — Dim-reduced HDBSCAN** (`pipeline_hdbscan`):
 ```
-1024d (Qwen3)  →[PCA]→  256d  →[UMAP, min_dist=0.0]→  64d  →[HDBSCAN]→  variable groups + noise
+1024d  →[PCA]→  50d  →[UMAP, metric=cosine, min_dist=0.0]→  5d  →[HDBSCAN]→  clusters
+                                                                    noise → nearest centroid
 ```
-- UMAP is **required** — HDBSCAN degrades significantly above ~64 dimensions (curse of dimensionality)
-- `min_dist=0.0` produces tighter local structure than the K-Means pipeline, which helps
-  HDBSCAN resolve cluster boundaries at low dimensionality
-- Documents that don't fit any cluster are labelled `-1` (noise), surfacing coherent
-  semantic groups without forcing every document into one
-- Complements K-Means by finding variable-density and irregular-shaped clusters
+- **PCA → UMAP required**: HDBSCAN degrades significantly above ~20 dimensions; reducing to 5d via UMAP (with PCA to 50d first for speed) is the standard fix
+- `min_dist=0.0` produces tight local structure that sharpens HDBSCAN's cluster boundaries
+- Run **per topic domain** — one HDBSCAN per primary policy topic
+- Noise points (`-1`) are **reassigned to their nearest cluster centroid** so the final output is also an exhaustive partition, matching the K-Means contract
+- Finds variable-density and irregular-shaped clusters that K-Means cannot capture
 
 **Shared components:**
-- **PCA** preserves 85–90% of variance while eliminating collinear dimensions
-- **UMAP** captures non-linear manifold structure that linear PCA misses
 - `evaluate_clusters()` — same pairwise classification F1 metric for both approaches
+- PCA and UMAP primitives (`reduce_pca`, `reduce_umap`) shared across pipelines
 
 ---
 
@@ -236,17 +251,17 @@ embedding matrix:
 
 | Stage | Input dim | Output dim | Method |
 |---|---|---|---|
-| PCA | 1024 | 256 | sklearn PCA, 87% variance explained |
-| UMAP | 256 | 64 | `n_neighbors=15`, `min_dist=0.1`, cosine metric |
-| FAISS K-Means | 64 | K=150 clusters | FAISS `Kmeans`, 25 iterations, 3 restarts |
+| *(none)* | 1024 | 1024 | No dim reduction — K-Means runs on raw embeddings |
+| FAISS K-Means | 1024 | K swept per topic | K ∈ {1,2,4,8,16,32,64,128,256,512}; best K by silhouette |
 
 **Approach 2 — Dim-reduced HDBSCAN (`pipeline_hdbscan`)**
 
 | Stage | Input dim | Output dim | Method |
 |---|---|---|---|
-| PCA | 1024 | 256 | sklearn PCA |
-| UMAP | 256 | 64 | `n_neighbors=15`, `min_dist=0.0` (tighter local structure) |
-| HDBSCAN | 64 | variable | `min_cluster_size=50`, `min_samples=10`, `cluster_selection=eom` |
+| PCA | 1024 | 50 | sklearn PCA |
+| UMAP | 50 | 5 | `n_neighbors=15`, `min_dist=0.0`, cosine metric |
+| HDBSCAN | 5 | variable | `min_cluster_size=15`, `min_samples=None` (→ min_cluster_size), `cluster_selection=eom` |
+| Noise reassignment | — | — | Noise points (-1) → nearest cluster centroid |
 
 ### Performance
 
