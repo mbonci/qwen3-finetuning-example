@@ -91,7 +91,7 @@ def run_experiment(
         triplets_path=str(pairs_path),
         output_dir=ft_output,
         epochs=epochs,
-        batch_size=batch_size,
+        contrastive_batch_size=batch_size,
         triplet_margin=0.3,
         seed=seed,
     )

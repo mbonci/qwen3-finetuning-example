@@ -47,7 +47,8 @@ class TestGradientFlow:
             triplets_path=str(pairs_path),
             output_dir=str(tmp_path / "run"),
             epochs=1,
-            batch_size=4,
+            contrastive_batch_size=4,
+            triplet_batch_size=4,
             seed=42,
         )
         train(cfg)

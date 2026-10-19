@@ -69,10 +69,12 @@ This repository implements a **mock data strategy** that faithfully mimics the p
                                      │
                                      ▼
   ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 3 — Triplet Fine-Tuning                               src/train.py │
+  │  Stage 3 — Hybrid Contrastive + Triplet Fine-Tuning         src/train.py │
   │                                                                          │
   │  Base model: Qwen3-Embedding-0.6B (595M params)                          │
-  │  Loss: Cosine-distance triplet loss  |  Margin: 0.3                      │
+  │  Objective 1: WeightedContrastiveLoss  |  margin=0.7  |  batch=8        │
+  │  Objective 2: TripletLoss (cosine)     |  margin=0.5  |  batch=32       │
+  │  Two objectives interleaved via model.fit(train_objectives=[...])        │
   │  Triplets: on-the-fly construction with transitive inference             │
   │  Hard negatives selected by descending cosine rank                       │
   │                                                                          │
@@ -130,14 +132,25 @@ positives and random negatives.
 
 ---
 
-### 2. Triplet Loss Optimization
+### 2. Hybrid Contrastive + Triplet Loss
 
-The model is trained with cosine-distance triplet loss:
+Training uses two interleaved objectives via `model.fit(train_objectives=[...])`:
 
+**Objective 1 — WeightedContrastiveLoss (margin = 0.7)**
+```
+L(a, b, y, w) = w × 0.5 × [y × d(a,b)²  +  (1-y) × max(0, margin − d(a,b))²]
+
+where  d(a, b) = 1 − cos(a, b)   and   y ∈ {0, 1}
+```
+Per-score sampling multipliers `{1: 4.0, 2: 2.0, 3: 0.5, 4: 0.2, 5: 0.2, 6: 1.0, 7: 4.0}`
+upweight hard/informative examples. Score 4 (boundary) is included as a hard
+training negative with low weight; it is excluded from the evaluation metric.
+
+**Objective 2 — TripletLoss (cosine distance, margin = 0.5)**
 ```
 L(a, p, n) = max(0,  d(a, p)  −  d(a, n)  +  margin)
 
-where  d(x, y) = 1 − cos(x, y)   and   margin = 0.3
+where  d(x, y) = 1 − cos(x, y)   and   margin = 0.5
 ```
 
 **Triplet construction** uses transitive inference: if the scored pair table
@@ -148,6 +161,11 @@ triplet count from the labeled pairs without additional API calls.
 **Hard-negative selection**: within each anchor's negative pool, candidates are
 sorted by descending cosine similarity — the most confusable negatives are
 presented first, keeping gradients informative throughout training.
+
+Both losses call `model(sentence_features[i])["sentence_embedding"]` — the
+differentiable forward path through the transformer. Using `model.encode()` in
+a training loop is a fatal bug: it runs under `torch.no_grad()` and
+`loss.backward()` becomes a no-op.
 
 ---
 
@@ -181,12 +199,15 @@ dimensionality reduction before clustering:
 | Base model | `Qwen/Qwen3-Embedding-0.6B` |
 | Embedding dimension | 1024 |
 | Max sequence length | 512 tokens |
-| Loss function | Cosine-distance triplet loss |
-| Triplet margin | 0.3 |
+| Loss 1 | WeightedContrastiveLoss (cosine distance) |
+| Contrastive margin | 0.7 |
+| Contrastive batch size | 8 |
+| Loss 2 | TripletLoss (cosine distance) |
+| Triplet margin | 0.5 |
+| Triplet batch size | 32 |
 | Learning rate | 2e-5 |
-| Batch size | 32 |
 | Epochs | 3 |
-| Warmup ratio | 0.10 |
+| Warmup steps | 100 |
 | Optimizer | AdamW |
 | Training pairs | ~100K labeled pairs → ~300K triplets |
 | Hardware | 1× RTX 4090, 32 GB VRAM |
