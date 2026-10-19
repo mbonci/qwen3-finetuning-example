@@ -142,9 +142,9 @@ Stratified sample → 100K pairs
 ```
 
 Key design decisions:
-- **Same-state exclusion**: pairs from the same US state are discarded — cross-state pairs test generalisation rather than near-duplicate matching
-- **Per-topic percentile bins**: thresholds are computed within each topic so the bin boundaries reflect each topic's distribution, not a global absolute threshold
-- **Stratified weight matrix**: BM25 pairs in mid-to-high cosine bins (q80_90, q90_95) receive the highest sampling weight; the exact weights were tuned on the proprietary corpus
+- **Same-state exclusion**: statutes from the same US state share drafting conventions and often reuse near-identical boilerplate, making same-state pairs trivially similar regardless of topic. Discarding them forces the model to learn substantive semantic similarity rather than stylistic overlap.
+- **Per-topic percentile bins**: cosine similarity distributions vary substantially across policy domains — Health statutes cluster at higher baseline similarity than, say, Foreign Trade. Computing bin thresholds as percentiles *within* each topic ensures the same bin label (e.g. q80_90) captures comparably informative pairs across all topics, rather than systematically over- or under-sampling dense domains.
+- **Stratified weight matrix**: BM25 retrieval biases toward lexically similar pairs, which tend to land in higher cosine bins. Left uncontrolled, the training set would be dominated by a single stratum. The weight matrix fixes the proportion of each (source, cosine_bin) cell in the final 100K pairs; weights were tuned on the proprietary corpus to balance coverage and informativeness.
 
 ---
 
