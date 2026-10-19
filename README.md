@@ -139,13 +139,13 @@ Per-topic percentile bins (thresholds computed within each topic):
 
 Stratified sample → 100K pairs:
   strata = BM25 × 5 bins + random × 5 bins (10 total)
-  weights concentrate on q80_90, q90_95, q95_100 (hard boundary cases)
+  weights peak at BM25 q80_90 (0.18) and q90_95 (0.16)
 ```
 
 Key design decisions:
 - **Same-state exclusion**: pairs from the same US state are discarded — cross-state pairs test generalisation rather than near-duplicate matching
 - **Per-topic percentile bins**: thresholds are computed within each topic so the bin boundaries reflect each topic's distribution, not a global absolute threshold
-- **Stratified weight matrix**: higher cosine bins (q80_90 and above) receive more weight — these pairs sit near the positive/negative decision boundary and carry the most useful gradient signal
+- **Stratified weight matrix**: BM25 pairs in mid-to-high cosine bins (q80_90, q90_95) receive the highest sampling weight; the exact weights were tuned on the proprietary corpus
 
 ---
 
