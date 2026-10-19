@@ -148,7 +148,7 @@ def mine_candidates(
     Candidate generation:
     - BM25 (bm25s): one index per topic, top-k retrieval per sampled anchor
     - Random within-topic: enforces different-state pairs when state_prefix_fn is set
-    - Merges both, deduplicates (BM25 takes priority), rebalances topics by median count
+    - Merges both, deduplicates (BM25 takes priority)
 
     Cosine binning (requires embeddings):
     - Per-topic percentile bins: q40_60, q60_80, q80_90, q90_95, q95_100
@@ -255,15 +255,6 @@ def mine_candidates(
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-
-    # --- Within-topic rebalancing: cap each topic at median count ---
-    topic_counts = df.groupby("topic_a").size()
-    cap = int(np.median(topic_counts.values))
-    df = (
-        df.groupby("topic_a", group_keys=False)
-        .apply(lambda g: g.sample(n=min(len(g), cap), random_state=seed))
-        .reset_index(drop=True)
-    )
 
     # --- Cosine similarity + per-topic percentile bins ---
     df["cosine_similarity"] = None

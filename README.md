@@ -49,7 +49,6 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   │  │  • Different-state only │   └──────────────────────────────────────┘  │
   │  └────────────┬────────────┘                         │                   │
   │               └──── merge + deduplicate (BM25 priority) ────────────────┘│
-  │                        Within-topic rebalancing (cap at median count)     │
   │                                        │                                 │
   │                                        ▼                                 │
   │               Per-topic percentile cosine bins (q40–q95)                 │
@@ -132,7 +131,6 @@ For each topic domain T:
 2.5M random within-topic pairs (different-state only)
 
 Merge + deduplicate (BM25 priority)
-Within-topic rebalancing: cap each topic at median(topic_counts)
 
 cosine_scores ← base_model.encode(all_pairs)
 Per-topic percentile bins (thresholds computed within each topic):
@@ -147,7 +145,6 @@ Stratified sample → 100K pairs:
 Key design decisions:
 - **Same-state exclusion**: pairs from the same US state are discarded — cross-state pairs test generalisation rather than near-duplicate matching
 - **Per-topic percentile bins**: thresholds are computed within each topic so the bin boundaries reflect each topic's distribution, not a global absolute threshold
-- **Within-topic rebalancing**: capping each topic at the median count prevents large topics (e.g. Government Operations, ~1.7M statutes) from dominating the training signal
 - **Stratified weight matrix**: higher cosine bins (q80_90 and above) receive more weight — these pairs sit near the positive/negative decision boundary and carry the most useful gradient signal
 
 ---
