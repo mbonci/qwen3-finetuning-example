@@ -1,21 +1,31 @@
 """Scalable semantic clustering of embedding vectors.
 
-Three-stage pipeline:
-  1. reduce_dimensions()  — PCA to 256d, then UMAP to lower dimension
-  2. cluster_kmeans()     — FAISS-accelerated K-Means (GPU or CPU)
-  3. cluster_hdbscan()    — Density-based clustering for irregular group shapes
+Two independent clustering approaches are exposed as top-level pipelines:
 
-Also provides evaluate_clusters() which computes clustering F1 on known similar
-pairs — the metric used to report the +0.20 improvement in the README.
+  pipeline_kmeans()   — PCA → UMAP (optional) → FAISS K-Means
+      Exhaustive partition (every document is assigned a cluster).
+      Scales to 8M+ documents via FAISS GPU acceleration.
+      UMAP can be skipped when embeddings are already low-dimensional.
 
-Usage (end-to-end mock run):
+  pipeline_hdbscan()  — PCA → UMAP → HDBSCAN
+      Density-based; finds clusters of arbitrary shape and size.
+      Labels noise points as -1 (documents that don't belong to any cluster).
+      UMAP is required — HDBSCAN degrades significantly above ~64 dimensions.
+
+Both pipelines share the same dim-reduction primitives (reduce_pca, reduce_umap)
+and the same evaluate_clusters() metric.
+
+Usage (end-to-end mock run showing both approaches):
     python src/cluster.py
 
 Usage (library):
-    from src.cluster import reduce_dimensions, cluster_kmeans, evaluate_clusters
-    reduced = reduce_dimensions(embeddings, pca_dim=256, umap_dim=64)
-    labels, centroids = cluster_kmeans(reduced, n_clusters=150)
-    f1 = evaluate_clusters(reduced, labels, val_pairs_df)
+    from src.cluster import pipeline_kmeans, pipeline_hdbscan, evaluate_clusters
+
+    km  = pipeline_kmeans(embeddings, n_clusters=150)
+    hdb = pipeline_hdbscan(embeddings, min_cluster_size=50)
+
+    f1_km  = evaluate_clusters(embeddings, km.labels,  val_pairs_df, doc_ids=ids)
+    f1_hdb = evaluate_clusters(embeddings, hdb.labels, val_pairs_df, doc_ids=ids)
 """
 
 from __future__ import annotations
@@ -53,7 +63,7 @@ class HDBSCANResult:
 
 @dataclass
 class ClusterEvalResult:
-    f1: float                   # macro F1 on known similar pairs
+    f1: float
     precision: float
     recall: float
     n_pairs_evaluated: int
@@ -61,8 +71,50 @@ class ClusterEvalResult:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Dimensionality Reduction
+# Dim-reduction primitives
 # ---------------------------------------------------------------------------
+
+def reduce_pca(
+    embeddings: np.ndarray,
+    n_components: int = 256,
+    random_state: int = 42,
+) -> np.ndarray:
+    """PCA reduction. Clamps n_components to min(n_components, orig_dim, n_docs-1)."""
+    n_docs, orig_dim = embeddings.shape
+    actual = min(n_components, orig_dim, n_docs - 1)
+    logger.info("PCA: %d → %d", orig_dim, actual)
+    pca = PCA(n_components=actual, random_state=random_state)
+    reduced = pca.fit_transform(embeddings).astype(np.float32)
+    logger.info("PCA explained variance: %.1f%%", pca.explained_variance_ratio_.sum() * 100)
+    return reduced
+
+
+def reduce_umap(
+    embeddings: np.ndarray,
+    n_components: int = 64,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+    metric: str = "cosine",
+    random_state: int = 42,
+) -> np.ndarray:
+    """UMAP reduction. Raises ImportError if umap-learn is not installed."""
+    try:
+        import umap as umap_lib
+    except ImportError as exc:
+        raise ImportError("umap-learn is required: pip install umap-learn") from exc
+
+    actual = min(n_components, embeddings.shape[1])
+    logger.info("UMAP: %d → %d", embeddings.shape[1], actual)
+    reducer = umap_lib.UMAP(
+        n_components=actual,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=random_state,
+        low_memory=True,
+    )
+    return reducer.fit_transform(embeddings).astype(np.float32)
+
 
 def reduce_dimensions(
     embeddings: np.ndarray,
@@ -72,51 +124,18 @@ def reduce_dimensions(
     umap_min_dist: float = 0.1,
     random_state: int = 42,
 ) -> np.ndarray:
-    """Reduce high-dimensional embeddings via PCA then UMAP.
-
-    PCA is applied first to bring embeddings to pca_dim dimensions (cheap,
-    linear, handles collinearity). UMAP then captures non-linear structure
-    for clustering.
-
-    Parameters
-    ----------
-    embeddings:       Float32 array of shape (n_docs, embedding_dim)
-    pca_dim:          Target dimensionality after PCA (256 recommended)
-    umap_dim:         Target dimensionality after UMAP (2 for viz, 64 for clustering)
-    umap_n_neighbors: UMAP neighborhood size (larger = more global structure)
-    umap_min_dist:    UMAP minimum distance (smaller = tighter clusters)
-
-    Returns
-    -------
-    Float32 array of shape (n_docs, umap_dim)
-    """
-    n_docs, orig_dim = embeddings.shape
-    logger.info("Input: %d docs × %d dims", n_docs, orig_dim)
-
-    actual_pca_dim = min(pca_dim, orig_dim, n_docs - 1)
-    logger.info("PCA: %d → %d", orig_dim, actual_pca_dim)
-    pca = PCA(n_components=actual_pca_dim, random_state=random_state)
-    reduced_pca = pca.fit_transform(embeddings).astype(np.float32)
-    explained = pca.explained_variance_ratio_.sum()
-    logger.info("PCA explained variance: %.1f%%", explained * 100)
-
-    actual_umap_dim = min(umap_dim, actual_pca_dim)
-    logger.info("UMAP: %d → %d", actual_pca_dim, actual_umap_dim)
+    """PCA then UMAP. Falls back to PCA-only if umap-learn is not installed."""
+    reduced = reduce_pca(embeddings, n_components=pca_dim, random_state=random_state)
     try:
-        import umap
-        reducer = umap.UMAP(
-            n_components=actual_umap_dim,
+        reduced = reduce_umap(
+            reduced,
+            n_components=umap_dim,
             n_neighbors=umap_n_neighbors,
             min_dist=umap_min_dist,
-            metric="cosine",
             random_state=random_state,
-            low_memory=True,
         )
-        reduced = reducer.fit_transform(reduced_pca).astype(np.float32)
     except ImportError:
         logger.warning("umap-learn not installed — returning PCA output only")
-        reduced = reduced_pca
-
     logger.info("Reduced: %d docs × %d dims", reduced.shape[0], reduced.shape[1])
     return reduced
 
@@ -247,6 +266,117 @@ def cluster_hdbscan(
 
 
 # ---------------------------------------------------------------------------
+# Approach 1: FAISS K-Means pipeline
+# ---------------------------------------------------------------------------
+
+def pipeline_kmeans(
+    embeddings: np.ndarray,
+    pca_dim: int = 256,
+    umap_dim: int | None = 64,
+    n_clusters: int = 150,
+    n_iter: int = 25,
+    n_redo: int = 3,
+    use_gpu: bool = False,
+    random_state: int = 42,
+) -> KMeansResult:
+    """Full pipeline: PCA → (optional UMAP) → FAISS K-Means.
+
+    UMAP is skipped when umap_dim is None or umap-learn is not installed.
+    This makes the pipeline usable on any machine; UMAP is a performance
+    optimisation for high-dimensional inputs, not a correctness requirement.
+
+    At 8M-document scale, FAISS K-Means with use_gpu=True finishes in minutes
+    vs. hours for sklearn; results in a fixed-size exhaustive partition
+    (every document is assigned to exactly one cluster).
+
+    Parameters
+    ----------
+    embeddings:   Float32 array of shape (n_docs, embedding_dim)
+    pca_dim:      PCA target; set to None to skip PCA
+    umap_dim:     UMAP target; set to None to skip UMAP
+    n_clusters:   K for K-Means
+    n_iter:       K-Means iterations
+    n_redo:       Independent restarts (best inertia kept)
+    use_gpu:      Use FAISS GPU index if available
+    random_state: Seed for PCA and UMAP
+    """
+    logger.info("Pipeline K-Means: %d docs × %d dims", *embeddings.shape)
+    reduced = embeddings
+
+    if pca_dim is not None:
+        reduced = reduce_pca(reduced, n_components=pca_dim, random_state=random_state)
+
+    if umap_dim is not None:
+        try:
+            reduced = reduce_umap(
+                reduced,
+                n_components=umap_dim,
+                random_state=random_state,
+            )
+        except ImportError:
+            logger.warning("umap-learn not installed — skipping UMAP for K-Means pipeline")
+
+    return cluster_kmeans(reduced, n_clusters=n_clusters, n_iter=n_iter,
+                          n_redo=n_redo, use_gpu=use_gpu)
+
+
+# ---------------------------------------------------------------------------
+# Approach 2: Dim-reduced HDBSCAN pipeline
+# ---------------------------------------------------------------------------
+
+def pipeline_hdbscan(
+    embeddings: np.ndarray,
+    pca_dim: int = 256,
+    umap_dim: int = 64,
+    umap_n_neighbors: int = 15,
+    umap_min_dist: float = 0.0,
+    min_cluster_size: int = 50,
+    min_samples: int = 10,
+    cluster_selection_method: str = "eom",
+    random_state: int = 42,
+) -> HDBSCANResult:
+    """Full pipeline: PCA → UMAP → HDBSCAN.
+
+    UMAP is required here, not optional: HDBSCAN's distance computations become
+    unreliable above ~64 dimensions (curse of dimensionality), and the algorithm
+    does not scale to 1024-dimensional inputs. The default umap_min_dist=0.0
+    produces tighter local structure than the K-Means pipeline (0.1), which
+    helps HDBSCAN resolve cluster boundaries at low dimensionality.
+
+    Documents that don't belong to any cluster are labelled -1 (noise).
+    This is a feature, not a bug: it lets the pipeline surface coherent semantic
+    groups without forcing every document into one.
+
+    Parameters
+    ----------
+    embeddings:               Float32 array of shape (n_docs, embedding_dim)
+    pca_dim:                  PCA target before UMAP
+    umap_dim:                 UMAP target (keep ≤ 64 for HDBSCAN to work well)
+    umap_n_neighbors:         UMAP neighborhood size
+    umap_min_dist:            UMAP min_dist; 0.0 gives tighter cluster cores
+    min_cluster_size:         Minimum points to form a cluster
+    min_samples:              HDBSCAN core-distance parameter
+    cluster_selection_method: 'eom' (excess of mass) or 'leaf'
+    random_state:             Seed for PCA and UMAP
+    """
+    logger.info("Pipeline HDBSCAN: %d docs × %d dims", *embeddings.shape)
+    reduced = reduce_pca(embeddings, n_components=pca_dim, random_state=random_state)
+    reduced = reduce_umap(
+        reduced,
+        n_components=umap_dim,
+        n_neighbors=umap_n_neighbors,
+        min_dist=umap_min_dist,
+        random_state=random_state,
+    )
+    return cluster_hdbscan(
+        reduced,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_method=cluster_selection_method,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -335,25 +465,39 @@ def evaluate_clusters(
 # ---------------------------------------------------------------------------
 
 def _mock_run() -> None:
-    """Smoke-test the full clustering pipeline with random embeddings."""
+    """Smoke-test both clustering pipelines with random embeddings."""
     n_docs, dim = 500, 128
     logger.info("Mock run: %d docs × %d dims", n_docs, dim)
     rng = np.random.default_rng(42)
     embeddings = rng.standard_normal((n_docs, dim)).astype(np.float32)
-
-    reduced = reduce_dimensions(embeddings, pca_dim=64, umap_dim=16)
-    logger.info("Reduced shape: %s", reduced.shape)
-
-    km = cluster_kmeans(reduced, n_clusters=20)
-    logger.info("K-Means: inertia=%.2f, unique_labels=%d", km.inertia, len(set(km.labels)))
+    doc_ids = [str(i) for i in range(n_docs)]
 
     mock_pairs = pd.DataFrame({
         "anchor_id": [str(i) for i in range(50)],
         "candidate_id": [str(i + 50) for i in range(50)],
         "similarity_score": rng.integers(1, 8, size=50),
     })
-    eval_result = evaluate_clusters(reduced, km.labels, mock_pairs)
-    logger.info("Eval F1: %.4f", eval_result.f1)
+
+    # --- Approach 1: FAISS K-Means ---
+    logger.info("=== Approach 1: FAISS K-Means ===")
+    km = pipeline_kmeans(embeddings, pca_dim=64, umap_dim=16, n_clusters=20)
+    logger.info("K-Means: inertia=%.2f, clusters=%d", km.inertia, len(set(km.labels)))
+    km_eval = evaluate_clusters(embeddings, km.labels, mock_pairs, doc_ids=doc_ids)
+    logger.info("K-Means eval: F1=%.4f  P=%.4f  R=%.4f", km_eval.f1, km_eval.precision, km_eval.recall)
+
+    # --- Approach 2: Dim-reduced HDBSCAN ---
+    logger.info("=== Approach 2: HDBSCAN ===")
+    try:
+        hdb = pipeline_hdbscan(embeddings, pca_dim=64, umap_dim=16, min_cluster_size=10, min_samples=3)
+        logger.info(
+            "HDBSCAN: %d clusters, %.1f%% noise",
+            hdb.n_clusters, hdb.noise_fraction * 100,
+        )
+        hdb_eval = evaluate_clusters(embeddings, hdb.labels, mock_pairs, doc_ids=doc_ids)
+        logger.info("HDBSCAN eval: F1=%.4f  P=%.4f  R=%.4f", hdb_eval.f1, hdb_eval.precision, hdb_eval.recall)
+    except ImportError as exc:
+        logger.warning("HDBSCAN pipeline skipped: %s", exc)
+
     logger.info("Mock run complete.")
 
 

@@ -99,8 +99,13 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  Stage 5 — Semantic Clustering                           src/cluster.py  │
   │                                                                          │
-  │  PCA (1024d → 256d)  →  UMAP (256d → 64d)                                │
-  │  FAISS K-Means (K=150)  +  HDBSCAN (min_cluster=50)                      │
+  │  Approach 1 — FAISS K-Means                                              │
+  │    PCA (1024d → 256d)  →  UMAP (256d → 64d)  →  FAISS K-Means (K=150)  │
+  │    Exhaustive partition; every document assigned to a cluster             │
+  │                                                                           │
+  │  Approach 2 — Dim-reduced HDBSCAN                                        │
+  │    PCA (1024d → 256d)  →  UMAP (256d → 64d, min_dist=0.0)               │
+  │    → HDBSCAN (min_cluster=50)  — noise points labelled -1                │
   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,24 +174,36 @@ a training loop is a fatal bug: it runs under `torch.no_grad()` and
 
 ---
 
-### 3. Scalable FAISS Vector Indexing
+### 3. Two-Approach Semantic Clustering
 
 After fine-tuning, the full 8M-statute corpus is embedded in parallel across
-24 SLURM shards. The resulting embedding matrix undergoes a three-stage
-dimensionality reduction before clustering:
+24 SLURM shards. Two independent clustering pipelines are run on the resulting
+embedding matrix:
 
+**Approach 1 — FAISS K-Means** (`pipeline_kmeans`):
 ```
 1024d (Qwen3)  →[PCA]→  256d  →[UMAP]→  64d  →[FAISS K-Means]→  K=150 groups
-                                                  + HDBSCAN for irregular clusters
 ```
+- Produces an **exhaustive partition**: every document is assigned exactly one cluster
+- UMAP is optional — can be skipped when embeddings are already low-dimensional
+- FAISS K-Means with GPU acceleration runs on the full 8M matrix in minutes vs. hours for sklearn
+- Best K is selected on the training split only (see `src/evaluate.py`)
 
-- **PCA** preserves 85–90% of variance while eliminating collinear dimensions and
-  reducing UMAP/FAISS compute
+**Approach 2 — Dim-reduced HDBSCAN** (`pipeline_hdbscan`):
+```
+1024d (Qwen3)  →[PCA]→  256d  →[UMAP, min_dist=0.0]→  64d  →[HDBSCAN]→  variable groups + noise
+```
+- UMAP is **required** — HDBSCAN degrades significantly above ~64 dimensions (curse of dimensionality)
+- `min_dist=0.0` produces tighter local structure than the K-Means pipeline, which helps
+  HDBSCAN resolve cluster boundaries at low dimensionality
+- Documents that don't fit any cluster are labelled `-1` (noise), surfacing coherent
+  semantic groups without forcing every document into one
+- Complements K-Means by finding variable-density and irregular-shaped clusters
+
+**Shared components:**
+- **PCA** preserves 85–90% of variance while eliminating collinear dimensions
 - **UMAP** captures non-linear manifold structure that linear PCA misses
-- **FAISS K-Means** with GPU acceleration runs on the full 8M matrix in minutes
-  vs. hours with sklearn; results in 150 semantically coherent policy groups
-- **HDBSCAN** is run on the same UMAP embedding to identify variable-density
-  clusters and flag noise points — complementing the K-Means partition
+- `evaluate_clusters()` — same pairwise classification F1 metric for both approaches
 
 ---
 
@@ -215,12 +232,21 @@ dimensionality reduction before clustering:
 
 ### Dimensionality Reduction & Clustering
 
+**Approach 1 — FAISS K-Means (`pipeline_kmeans`)**
+
 | Stage | Input dim | Output dim | Method |
 |---|---|---|---|
 | PCA | 1024 | 256 | sklearn PCA, 87% variance explained |
 | UMAP | 256 | 64 | `n_neighbors=15`, `min_dist=0.1`, cosine metric |
-| K-Means | 64 | K=150 clusters | FAISS `Kmeans`, 25 iterations, 3 restarts |
-| HDBSCAN | 64 | variable | `min_cluster_size=50`, `min_samples=10` |
+| FAISS K-Means | 64 | K=150 clusters | FAISS `Kmeans`, 25 iterations, 3 restarts |
+
+**Approach 2 — Dim-reduced HDBSCAN (`pipeline_hdbscan`)**
+
+| Stage | Input dim | Output dim | Method |
+|---|---|---|---|
+| PCA | 1024 | 256 | sklearn PCA |
+| UMAP | 256 | 64 | `n_neighbors=15`, `min_dist=0.0` (tighter local structure) |
+| HDBSCAN | 64 | variable | `min_cluster_size=50`, `min_samples=10`, `cluster_selection=eom` |
 
 ### Performance
 
