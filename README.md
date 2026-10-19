@@ -263,11 +263,51 @@ embedding matrix:
 | `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Trained on 8M-statute contrastive pairs |
 | **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
 
-**Metric definition** — pairwise classification F1 via cluster membership: two documents
-are predicted similar if they share the same K-Means cluster label. Ground-truth positives
-are pairs with LLM-judge score ∈ {1, 2, 3}; negatives use scores ∈ {5, 6, 7} (scores 4
-and 8 are excluded). Best K is selected on the training split only; the test split is held
-out until after K is chosen to prevent label leakage. See `src/evaluate.py`.
+### Validation Methodology
+
+Evaluation is implemented in `src/evaluate.py`. Several design decisions are non-obvious:
+
+**Prediction rule — cluster membership as binary similarity**
+
+Two documents are predicted similar if and only if they share the **same K-Means cluster label**
+(and that label ≠ −1). This is a deliberate choice: the downstream use case is semantic grouping
+(documents are routed to groups, not ranked pairwise), so the metric is measured at clustering
+granularity — not cosine similarity threshold.
+
+**Score inclusion / exclusion**
+
+| LLM-judge score | Meaning | Role in evaluation |
+|---|---|---|
+| 1, 2, 3 | Related / similar statutes | Ground-truth **positive** |
+| 4 | Borderline (annotator uncertainty) | **Excluded** |
+| 5, 6, 7 | Unrelated / dissimilar statutes | Ground-truth **negative** |
+| 8 | N/A (off-topic pair) | **Excluded** |
+
+Score 4 is excluded because the LLM judge rubric places it explicitly at the decision boundary
+— pairs with score 4 carry genuine annotator uncertainty and would add noise to both precision
+and recall if included. Score 8 marks pairs the judge could not evaluate (e.g. one statute is
+a procedural header with no semantic content).
+
+**K-selection protocol — train/test split**
+
+```
+All labeled pairs (scores 1–3, 5–7)
+        │
+        ├── 80% → train split  ← K is swept here (K ∈ {5, 10, …, 150})
+        │                         Best K = argmax train_F1 (ties: larger K)
+        │
+        └── 20% → test split   ← Held out until after K is chosen
+                                  Final reported F1 is TEST F1
+```
+
+Sweeping K on the full dataset and then reporting F1 on the same dataset inflates results:
+K-Means will find a partition that memorises the structure of the labeled pairs. Selecting best K
+on the train split only and evaluating on the **held-out test split** is the correct protocol
+— it tests whether the learned clusters generalise to unseen labeled pairs.
+
+The +0.20 F1 figure in the Performance table is the test-split F1 of the fine-tuned model
+minus the test-split F1 of the base model, at their respective best-K values, evaluated on
+the proprietary corpus.
 
 ---
 
