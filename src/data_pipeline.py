@@ -191,13 +191,18 @@ def mine_candidates(
 
         retriever = bm25s.BM25()
         retriever.index(bm25s.tokenize([texts[m] for m in members]))
-        member_index = {m: i for i, m in enumerate(members)}
 
-        for anchor in anchors:
-            query_tokens = bm25s.tokenize([texts[anchor]])
-            k = min(bm25_top_k + 1, len(members))
-            results, _ = retriever.retrieve(query_tokens, k=k)
-            for idx in results[0]:
+        # Filter anchors with non-empty text, then batch-retrieve all at once
+        valid_anchors = [(a, texts[a]) for a in anchors if texts.get(a)]
+        if not valid_anchors:
+            continue
+        valid_ids, valid_queries = zip(*valid_anchors)
+
+        k = min(bm25_top_k + 1, len(members))
+        batch_results, _ = retriever.retrieve(bm25s.tokenize(list(valid_queries)), k=k)
+
+        for i, anchor in enumerate(valid_ids):
+            for idx in batch_results[i]:
                 candidate = members[int(idx)]
                 if candidate == anchor:
                     continue
