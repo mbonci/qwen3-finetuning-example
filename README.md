@@ -247,7 +247,6 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 
 | Stage | Input dim | Output dim | Method |
 |---|---|---|---|
-| *(none)* | 1024 | 1024 | No dim reduction — K-Means runs on raw embeddings |
 | FAISS K-Means | 1024 | K swept per topic | K ∈ {1,2,4,8,16,32,64,128,256,512}; best K by silhouette |
 
 **Approach 2 — Dim-reduced HDBSCAN (`pipeline_hdbscan`)**
