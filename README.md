@@ -80,8 +80,15 @@ Filled = before fine-tuning; dashed = after. Green = positive pairs (similar sta
   │   1-3 → Positive (related)    4-7 → Negative (unrelated)   8 → N/A      │
   │                                                                          │
   │  Exponential backoff retry  |  Checkpoint every 20K rows                 │
+  │                                                                          │
+  │  Stratified 80/20 split within each topic (scores 1–3, 5–7 only)        │
+  │  ┌────────────────────────────┐   ┌───────────────────────────────────┐  │
+  │  │  80% → train labels        │   │  20% → test labels  🔒 held out   │  │
+  │  │  used for fine-tuning and  │   │  not touched until Stage 6        │  │
+  │  │  K selection (Stage 3 & 5) │   │  evaluation                       │  │
+  │  └────────────────────────────┘   └───────────────────────────────────┘  │
   └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
+                                     │  (train labels only)
                                      ▼
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  Stage 3 — Hybrid Contrastive + Triplet Fine-Tuning         src/train.py │
@@ -127,10 +134,9 @@ Filled = before fine-tuning; dashed = after. Green = positive pairs (similar sta
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  Stage 6 — Evaluation                                   src/evaluate.py  │
   │                                                                          │
-  │  Labeled pairs (scores 1–3, 5–7) split 80/20 within each topic          │
+  │  K swept per topic on train labels; best K = argmax train_F1             │
   │  Prediction: same cluster label → predicted similar                      │
-  │  K swept per topic on train split; best K = argmax train_F1              │
-  │  Final metric: pairwise classification F1 on held-out test split         │
+  │  Final metric: pairwise classification F1 on 🔒 held-out test labels     │
   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
