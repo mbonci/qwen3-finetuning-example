@@ -121,6 +121,16 @@ Filled = before fine-tuning; dashed = after. Green = positive pairs (similar sta
   │  Approach 2 — Dim-reduced HDBSCAN                                        │
   │    PCA (1024d → 50d)  →  UMAP (50d → 5d, min_dist=0.0, metric=cosine)   │
   │    → HDBSCAN (min_cluster=15)  → noise reassigned to nearest centroid    │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 6 — Evaluation                                   src/evaluate.py  │
+  │                                                                          │
+  │  Labeled pairs (scores 1–3, 5–7) split 80/20 within each topic          │
+  │  Prediction: same cluster label → predicted similar                      │
+  │  K swept per topic on train split; best K = argmax train_F1              │
+  │  Final metric: pairwise classification F1 on held-out test split         │
   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
