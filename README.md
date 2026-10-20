@@ -194,7 +194,7 @@ embedding matrix:
 **Approach 1 — FAISS K-Means** (`pipeline_kmeans`):
 ```
 Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
-                          Best K selected by silhouette score
+                          Best K per topic by pairwise F1 on held-out labels
 ```
 - **No dimensionality reduction**: K-Means operates directly on the 1024d Qwen3 embeddings; the distances are already meaningful in that space
 - Run **per topic domain** — one K-Means per primary policy topic; K is swept over `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]` and the best K is selected by pairwise classification F1 on a held-out label split
