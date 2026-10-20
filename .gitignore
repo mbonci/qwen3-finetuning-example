@@ -18,3 +18,4 @@ logs/
 *.parquet
 *.tmp
 .DS_Store
+NOTES.md
