@@ -4,7 +4,7 @@ Two independent clustering approaches are exposed as top-level pipelines:
 
   pipeline_kmeans()   — FAISS K-Means directly on raw embeddings (no PCA/UMAP)
       Exhaustive partition. Scales to 8M+ docs via FAISS GPU. K swept per topic;
-      best K selected by silhouette score.
+      best K selected by pairwise classification F1 on held-out labels.
 
   pipeline_hdbscan()  — PCA (→50d) → UMAP (→5d) → HDBSCAN
       Density-based; finds irregular-shaped clusters. UMAP is required — HDBSCAN
@@ -311,7 +311,7 @@ def pipeline_kmeans(
     K-Means does not require dimensionality reduction: it operates directly
     in the embedding space where the distances are already meaningful. At
     8M-document scale, FAISS GPU acceleration makes this fast without PCA/UMAP.
-    K is swept per topic with silhouette score to select the best partition.
+    K is swept per topic; best K selected by pairwise classification F1 on held-out labels.
 
     Parameters
     ----------

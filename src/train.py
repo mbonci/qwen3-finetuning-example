@@ -62,7 +62,7 @@ DEFAULT_SAMPLING_MULTIPLIERS: dict[int, float] = {
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     triplets_path: str = "data/mock_pairs.jsonl"
     output_dir: str = "runs/default"
     epochs: int = 3
@@ -80,6 +80,7 @@ class TrainConfig:
     seed: int = 42
     # Set from SLURM_ARRAY_TASK_ID when running on HPC
     task_id: int = field(default_factory=lambda: int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
+    max_steps: int = -1  # -1 = no limit (use epochs); set >0 to cap steps for quick smoke tests
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +454,7 @@ def train(cfg: TrainConfig) -> None:
     pair_ds_for_viz = PairDatasetFromPairs(cfg.triplets_path)
     s1_viz = [ex.texts[0] for ex in pair_ds_for_viz.examples]
     s2_viz = [ex.texts[1] for ex in pair_ds_for_viz.examples]
-    labels_viz = [int(ex.label) for ex in pair_ds_for_viz.examples]
+    labels_viz = [int(ex.label[0]) if isinstance(ex.label, (list, tuple)) else int(ex.label) for ex in pair_ds_for_viz.examples]
     before_dists = get_similarity_distributions(model, s1_viz, s2_viz, labels_viz)
 
     # --- Objective 1: weighted pairwise contrastive ---
@@ -503,7 +504,7 @@ def train(cfg: TrainConfig) -> None:
 
     # model.fit() interleaves batches from both objectives each step.
     # It uses the differentiable forward path internally (not model.encode()).
-    model.fit(
+    fit_kwargs: dict = dict(
         train_objectives=train_objectives,
         epochs=cfg.epochs,
         warmup_steps=cfg.warmup_steps,
@@ -512,6 +513,10 @@ def train(cfg: TrainConfig) -> None:
         show_progress_bar=True,
         max_grad_norm=cfg.max_grad_norm,
     )
+    if cfg.max_steps > 0:
+        fit_kwargs["steps_per_epoch"] = cfg.max_steps
+        fit_kwargs["epochs"] = 1
+    model.fit(**fit_kwargs)
     logger.info("Training complete. Model saved to %s", output_dir / "final")
     (output_dir / "config.json").write_text(json.dumps(cfg.__dict__, default=str, indent=2))
 
@@ -528,7 +533,7 @@ def train(cfg: TrainConfig) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fine-tune Qwen3-Embedding-0.6B with hybrid loss")
-    p.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--triplets", default="data/mock_pairs.jsonl")
     p.add_argument("--output", default="runs/default")
     p.add_argument("--epochs", type=int, default=3)
@@ -537,6 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--contrastive-margin", type=float, default=0.7)
     p.add_argument("--triplet-margin", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-steps", type=int, default=-1, help="Cap training steps (use 2-3 for a quick smoke test)")
     return p
 
 
@@ -552,5 +558,6 @@ if __name__ == "__main__":
         contrastive_margin=args.contrastive_margin,
         triplet_margin=args.triplet_margin,
         seed=args.seed,
+        max_steps=args.max_steps,
     )
     train(cfg)
