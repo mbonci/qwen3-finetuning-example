@@ -104,7 +104,7 @@ This repository implements a **mock data strategy** that faithfully mimics the p
   │                                                                          │
   │  Approach 1 — FAISS K-Means (no dim reduction)                           │
   │    Raw 1024d embeddings  →  FAISS K-Means, K swept per topic             │
-  │    Best K selected by silhouette score; exhaustive partition              │
+  │    Best K per topic by pairwise F1 on held-out labels; exhaustive partition│
   │                                                                           │
   │  Approach 2 — Dim-reduced HDBSCAN                                        │
   │    PCA (1024d → 50d)  →  UMAP (50d → 5d, min_dist=0.0, metric=cosine)   │
@@ -197,7 +197,7 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
                           Best K selected by silhouette score
 ```
 - **No dimensionality reduction**: K-Means operates directly on the 1024d Qwen3 embeddings; the distances are already meaningful in that space
-- Run **per topic domain** — one K-Means per primary policy topic; K is swept over `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]` and the best K is selected by silhouette score
+- Run **per topic domain** — one K-Means per primary policy topic; K is swept over `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]` and the best K is selected by pairwise classification F1 on a held-out label split
 - FAISS K-Means with GPU acceleration handles each topic in seconds; sklearn fallback for small topics (<2000 statutes)
 - Exhaustive partition: every document is assigned to exactly one cluster
 
@@ -246,7 +246,7 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 
 | Stage | Input dim | Output dim | Method |
 |---|---|---|---|
-| FAISS K-Means | 1024 | K swept per topic | K ∈ {1,2,4,8,16,32,64,128,256,512}; best K by silhouette |
+| FAISS K-Means | 1024 | K swept per topic | K ∈ {1,2,4,8,16,32,64,128,256,512}; best K per topic by pairwise F1 on held-out labels |
 
 **Approach 2 — Dim-reduced HDBSCAN (`pipeline_hdbscan`)**
 
@@ -305,26 +305,31 @@ Score 4 is excluded because the LLM judge rubric places it explicitly at the dec
 and recall if included. Score 8 marks pairs the judge could not evaluate (e.g. one statute is
 a procedural header with no semantic content).
 
-**K-selection protocol — train/test split**
+**K-selection protocol — per-topic, train/test split**
 
 ```
 All labeled pairs (scores 1–3, 5–7)
         │
-        ├── 80% → train split  ← K is swept here (K ∈ {5, 10, …, 150})
-        │                         Best K = argmax train_F1 (ties: larger K)
-        │
-        └── 20% → test split   ← Held out until after K is chosen
-                                  Final reported F1 is TEST F1
+        └── Stratified 80/20 split within each topic
+                │
+                ├── 80% → train split  ← K swept per topic (K ∈ {1,2,4,8,…,512})
+                │                         Best K per topic = argmax train_F1 (ties: larger K)
+                │
+                └── 20% → test split   ← Held out until after K is chosen
+                                          Final reported F1 is TEST F1
 ```
 
-Sweeping K on the full dataset and then reporting F1 on the same dataset inflates results:
-K-Means will find a partition that memorises the structure of the labeled pairs. Selecting best K
-on the train split only and evaluating on the **held-out test split** is the correct protocol
-— it tests whether the learned clusters generalise to unseen labeled pairs.
+K is selected **independently per policy topic** — each topic may settle on a different K.
+Stratifying the split within each topic ensures representative label coverage at both stages.
 
-The +0.20 F1 figure in the Performance table is the test-split F1 of the fine-tuned model
-minus the test-split F1 of the base model, at their respective best-K values, evaluated on
-the proprietary corpus.
+Sweeping K on the full dataset and reporting F1 on the same data inflates results because
+K-Means can find a partition that memorises the labeled pairs. Selecting best K on the train
+split and evaluating on the **held-out test split** tests whether the clusters generalise to
+unseen labeled pairs.
+
+The +0.20 F1 figure in the Performance table is the mean test-split F1 across topics for the
+fine-tuned model minus the same for the base model, each at their per-topic best-K, evaluated
+on the proprietary corpus.
 
 ---
 

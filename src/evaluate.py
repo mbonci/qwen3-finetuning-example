@@ -6,8 +6,9 @@ reported in the README. The key design decisions:
   - Positive = same cluster label, ground-truth score ∈ {1, 2, 3}
   - Negative = different cluster label, ground-truth score ∈ {5, 6, 7}
   - Scores 4 and 8 are excluded from evaluation (boundary / N/A)
-  - Best-K is selected on the TRAIN split only; the TEST split is held out
-    until after K is chosen to prevent label leakage
+  - Best-K is selected per topic on the TRAIN split only; the TEST split is
+    held out until after K is chosen to prevent label leakage
+  - Split is stratified within each topic (matching the private pipeline)
   - K is swept over a configurable range; ties broken by preferring larger K
 
 Usage:
@@ -117,11 +118,23 @@ def evaluate_model(
     eval_df = pairs_df[pairs_df["similarity_score"].isin(EVAL_SCORES)].copy()
     eval_df["similarity_score"] = eval_df["similarity_score"].astype(int)
 
+    # Stratified split within each topic — matches private c00_split_random_pairs.py
+    topic_col = "primary_topic_a" if "primary_topic_a" in eval_df.columns else None
     rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(eval_df))
-    n_train = int(len(eval_df) * train_frac)
-    train_df = eval_df.iloc[idx[:n_train]]
-    test_df = eval_df.iloc[idx[n_train:]]
+    train_chunks, test_chunks = [], []
+    if topic_col is not None:
+        for _, group in eval_df.groupby(topic_col):
+            group = group.sample(frac=1, random_state=seed)
+            n_test = max(1, int(len(group) * (1 - train_frac)))
+            test_chunks.append(group.iloc[:n_test])
+            train_chunks.append(group.iloc[n_test:])
+        train_df = pd.concat(train_chunks).reset_index(drop=True)
+        test_df = pd.concat(test_chunks).reset_index(drop=True)
+    else:
+        idx = rng.permutation(len(eval_df))
+        n_train = int(len(eval_df) * train_frac)
+        train_df = eval_df.iloc[idx[:n_train]]
+        test_df = eval_df.iloc[idx[n_train:]]
 
     # Collect unique texts for embedding
     all_texts: dict[str, str] = {}
