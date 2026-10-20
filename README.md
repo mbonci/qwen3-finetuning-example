@@ -1,6 +1,6 @@
 # Legal Statute Representation Learning at Scale
 
-![Python](https://img.shields.io/badge/python-3.10-blue?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![HuggingFace](https://img.shields.io/badge/🤗-Qwen3--Embedding--0.6B-orange)
 ![SLURM](https://img.shields.io/badge/HPC-SLURM%20Array-purple?logo=linux&logoColor=white)
