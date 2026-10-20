@@ -39,13 +39,45 @@ Filled = before fine-tuning; dashed = after. Green = positive pairs (similar sta
 
 ```mermaid
 flowchart TD
-    A[8M-statute research corpus] --> B[BM25 + random within-topic candidate mining]
-    B --> C[Cosine similarity stratification]
-    C --> D[LLM-judged ordinal similarity labels]
-    D --> E[Qwen3-Embedding-0.6B fine-tuning]
-    E --> F[Sharded embedding inference]
-    F --> G[FAISS K-Means / PCA + UMAP + HDBSCAN]
-    G --> H[Held-out pairwise cluster evaluation]
+    A["🗄️ Raw Corpus\n8M legal statutes · 50 US states\nTopic-classified · deduplicated"]
+
+    A --> B1
+    A --> B2
+
+    subgraph S1 ["Stage 1 — Contrastive Pair Mining · src/data_pipeline.py"]
+        B1["BM25 Mining (bm25s)\nOne index per topic · 5% anchors (floor 1K)\nTop-100 per anchor · different-state only"]
+        B2["Random Within-Topic Sampling\n2.5M pairs · different-state only"]
+        B3["Merge + deduplicate (BM25 priority)\nPer-topic percentile cosine bins (q40–q95)\nPairs below 40th pct → excluded\nStratified sample → 100K pairs\n10 strata: source {bm25, random} × cosine_bin"]
+        B1 --> B3
+        B2 --> B3
+    end
+
+    subgraph S2 ["Stage 2 — LLM-as-a-Judge Scoring · src/data_pipeline.py"]
+        C["gpt-4.1-mini · 35 workers · scores 1–8\n1–3 = positive · 4–7 = negative · 8 = N/A\nExponential backoff · checkpoint every 20K rows"]
+    end
+
+    subgraph S3 ["Stage 3 — Hybrid Fine-Tuning · src/train.py"]
+        D["Qwen3-Embedding-0.6B (595M params)\nObjective 1: WeightedContrastiveLoss margin=0.7 batch=8\nObjective 2: TripletLoss (cosine) margin=0.5 batch=32\nInterleaved via model.fit(train_objectives=[...])\nTriplets: transitive inference · hard-neg by cosine rank\n24 SLURM tasks × RTX 4090 32GB"]
+    end
+
+    subgraph S4 ["Stage 4 — Corpus-Scale Inference · src/inference.py"]
+        E["8M statutes · 24 SLURM shards\nCUDA OOM retry (halve batch)\nOutput: zstd parquet · Arrow fixed-size-list embeddings"]
+    end
+
+    subgraph S5 ["Stage 5 — Semantic Clustering · src/cluster.py"]
+        F1["FAISS K-Means\nRaw 1024d · K swept per topic\n{1,2,4,8,16,32,64,128,256,512}"]
+        F2["PCA→50d · UMAP→5d (cosine, min_dist=0)\nHDBSCAN min_cluster=15\nNoise → nearest centroid"]
+    end
+
+    G["Pairwise cluster F1 · src/evaluate.py\nStratified 80/20 split per topic\nBest K per topic = argmax train_F1"]
+
+    B3 --> C
+    C --> D
+    D --> E
+    E --> F1
+    E --> F2
+    F1 --> G
+    F2 --> G
 ```
 
 The original pipeline mined approximately 100K labeled pairs, trained with weighted contrastive and triplet objectives, and produced embeddings over the full corpus using 24 Slurm inference shards. The public modules illustrate these stages; the proprietary data and full infrastructure are not included.
