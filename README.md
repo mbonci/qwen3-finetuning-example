@@ -257,29 +257,6 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 | HDBSCAN | 5 | variable | `min_cluster_size=15`, `min_samples=None` (→ min_cluster_size), `cluster_selection=eom` |
 | Noise reassignment | — | — | Noise points (-1) → nearest cluster centroid |
 
-### Performance
-
-> **Historical research results — proprietary corpus only.** The numbers below
-> were produced by running the full pipeline on the institutional HPC cluster
-> against the 8M-statute corpus. They cannot be independently reproduced from
-> this public repository because the training corpus is not included. `src/experiment.py`
-> provides a synthetic demo that verifies gradient flow and metric correctness on
-> mock data; its output should not be compared to these figures.
-
-| Model | Pairwise Classification F1 | Notes |
-|---|---|---|
-| `Qwen3-Embedding-0.6B` (base) | 0.61 | Zero-shot, no fine-tuning |
-| `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Trained on 8M-statute contrastive pairs |
-| **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
-
-**Cosine similarity distributions before and after fine-tuning** (two representative topics, proprietary corpus):
-
-| Health | Government Operations |
-|:---:|:---:|
-| ![Health KDE](assets/cosine_kde_health.png) | ![Government Operations KDE](assets/cosine_kde_government_operations.png) |
-
-Filled = before fine-tuning; dashed = after. Green = positive pairs (similar statutes), red = negative pairs (dissimilar). After training the distributions separate cleanly — positives shift right toward cosine ≈ 0.9 and negatives shift left toward ≈ 0.0. `train.py` generates an equivalent plot for any run at `runs/<name>/task_00/visualization/cosine_kde.png`.
-
 ### Validation Methodology
 
 Evaluation is implemented in `src/evaluate.py`. Several design decisions are non-obvious:
@@ -330,6 +307,31 @@ unseen labeled pairs.
 The +0.20 F1 figure in the Performance table is the mean test-split F1 across topics for the
 fine-tuned model minus the same for the base model, each at their per-topic best-K, evaluated
 on the proprietary corpus.
+
+---
+
+### Performance
+
+> **Historical research results — proprietary corpus only.** The numbers below
+> were produced by running the full pipeline on the institutional HPC cluster
+> against the 8M-statute corpus. They cannot be independently reproduced from
+> this public repository because the training corpus is not included. `src/experiment.py`
+> provides a synthetic demo that verifies gradient flow and metric correctness on
+> mock data; its output should not be compared to these figures.
+
+| Model | Pairwise Classification F1 | Notes |
+|---|---|---|
+| `Qwen3-Embedding-0.6B` (base) | 0.61 | Zero-shot, no fine-tuning |
+| `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Fine-tuned with contrastive + triplet loss |
+| **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
+
+**Cosine similarity distributions before and after fine-tuning** (two representative topics, proprietary corpus):
+
+| Health | Government Operations |
+|:---:|:---:|
+| ![Health KDE](assets/cosine_kde_health.png) | ![Government Operations KDE](assets/cosine_kde_government_operations.png) |
+
+Filled = before fine-tuning; dashed = after. Green = positive pairs (similar statutes), red = negative pairs (dissimilar). After training the distributions separate cleanly — positives shift right toward cosine ≈ 0.9 and negatives shift left toward ≈ 0.0. `train.py` generates an equivalent plot for any run at `runs/<name>/task_00/visualization/cosine_kde.png`.
 
 ---
 
