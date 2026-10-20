@@ -352,9 +352,14 @@ This repository provides **synthetic fixtures and selected executable components
 
 ## 🚀 Quick Start
 
+> **Model defaults:** All scripts default to `sentence-transformers/all-MiniLM-L6-v2` (22M params, ~2 min on CPU/MPS) so the demo runs on any machine without a GPU. Pass `--model Qwen/Qwen3-Embedding-0.6B` to any script to use the model from the research pipeline.
+
+> **Python version:** Requires Python 3.12+; tested with Python 3.14.7 (Homebrew). On macOS, use Homebrew Python (`/opt/homebrew/bin/python3`) — pyenv builds often lack `lzma` support which breaks `sentence-transformers`. If using pyenv, run `brew install xz` before `pyenv install 3.12.x` to ensure a complete build. `faiss-cpu` is intentionally excluded from `requirements.txt` (segfaults on Apple Silicon via pip); sklearn is used as the fallback for local runs.
+
 **1. Generate mock data** (no external dependencies required):
 
 ```bash
+/opt/homebrew/bin/python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python src/generate_mock_data.py
 # → data/mock_pairs.jsonl (~200 anchor-centric statute pairs)
@@ -376,6 +381,11 @@ python src/train.py \
   --output   runs/mock_run \
   --epochs   1 \
   --batch-size 4
+# → runs/mock_run/task_00/final/         fine-tuned model
+# → runs/mock_run/task_00/visualization/cosine_kde.png   before/after cosine KDE
+
+# To run with the research model instead:
+# python src/train.py --model Qwen/Qwen3-Embedding-0.6B ...  (requires ~2 GB download + GPU)
 ```
 
 **4. Extract embeddings; optionally run the standalone clustering smoke test**:
