@@ -37,47 +37,91 @@ Filled = before fine-tuning; dashed = after. Green = positive pairs (similar sta
 
 ## Pipeline at a glance
 
-```mermaid
-flowchart TD
-    A["🗄️ Raw Corpus\n8M legal statutes · 50 US states\nTopic-classified · deduplicated"]
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Document Intelligence Pipeline                           │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-    A --> B1
-    A --> B2
-
-    subgraph S1 ["Stage 1 — Contrastive Pair Mining · src/data_pipeline.py"]
-        B1["BM25 Mining (bm25s)\nOne index per topic · 5% anchors (floor 1K)\nTop-100 per anchor · different-state only"]
-        B2["Random Within-Topic Sampling\n2.5M pairs · different-state only"]
-        B3["Merge + deduplicate (BM25 priority)\nPer-topic percentile cosine bins (q40–q95)\nPairs below 40th pct → excluded\nStratified sample → 100K pairs\n10 strata: source {bm25, random} × cosine_bin"]
-        B1 --> B3
-        B2 --> B3
-    end
-
-    subgraph S2 ["Stage 2 — LLM-as-a-Judge Scoring · src/data_pipeline.py"]
-        C["gpt-4.1-mini · 35 workers · scores 1–8\n1–3 = positive · 4–7 = negative · 8 = N/A\nExponential backoff · checkpoint every 20K rows"]
-    end
-
-    subgraph S3 ["Stage 3 — Hybrid Fine-Tuning · src/train.py"]
-        D["Qwen3-Embedding-0.6B (595M params)\nObjective 1: WeightedContrastiveLoss margin=0.7 batch=8\nObjective 2: TripletLoss (cosine) margin=0.5 batch=32\nInterleaved via model.fit(train_objectives=[...])\nTriplets: transitive inference · hard-neg by cosine rank\n24 SLURM tasks × RTX 4090 32GB"]
-    end
-
-    subgraph S4 ["Stage 4 — Corpus-Scale Inference · src/inference.py"]
-        E["8M statutes · 24 SLURM shards\nCUDA OOM retry (halve batch)\nOutput: zstd parquet · Arrow fixed-size-list embeddings"]
-    end
-
-    subgraph S5 ["Stage 5 — Semantic Clustering · src/cluster.py"]
-        F1["FAISS K-Means\nRaw 1024d · K swept per topic\n{1,2,4,8,16,32,64,128,256,512}"]
-        F2["PCA→50d · UMAP→5d (cosine, min_dist=0)\nHDBSCAN min_cluster=15\nNoise → nearest centroid"]
-    end
-
-    G["Pairwise cluster F1 · src/evaluate.py\nStratified 80/20 split per topic\nBest K per topic = argmax train_F1"]
-
-    B3 --> C
-    C --> D
-    D --> E
-    E --> F1
-    E --> F2
-    F1 --> G
-    F2 --> G
+  ┌──────────────────┐
+  │  Raw Corpus      │  8M legal statutes across 50 US states
+  │  (proprietary)   │  Deduplicated, topic-classified (8 domains)
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 1 — Contrastive Pair Mining                  src/data_pipeline.py │
+  │                                                                          │
+  │  ┌─────────────────────────┐   ┌──────────────────────────────────────┐  │
+  │  │  BM25 (bm25s) Mining    │   │  Random Within-Topic Sampling        │  │
+  │  │                         │   │                                      │  │
+  │  │  • One index per topic  │   │  • 2.5M random within-topic pairs    │  │
+  │  │  • 5% anchors per topic │   │  • Different-state pairs only        │  │
+  │  │    (floor: 1K/topic)    │   │  • Deduplication (order-invariant)   │  │
+  │  │  • Top-100 per anchor   │   │                                      │  │
+  │  │  • Different-state only │   └──────────────────────────────────────┘  │
+  │  └────────────┬────────────┘                         │                   │
+  │               └──── merge + deduplicate (BM25 priority) ────────────────┘│
+  │                                        │                                 │
+  │                                        ▼                                 │
+  │               Per-topic percentile cosine bins (q40–q95)                 │
+  │               Pairs below 40th percentile of topic → excluded            │
+  │                                        │                                 │
+  │                    Stratified sampling from 10 strata → 100K pairs       │
+  │           BM25 × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
+  │         Random × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 2 — LLM-as-a-Judge Scoring                   src/data_pipeline.py │
+  │                                                                          │
+  │  Model: gpt-4.1-mini  |  Concurrency: 35 workers  |  Scores: 1–8        │
+  │                                                                          │
+  │   1-3 → Positive (related)    4-7 → Negative (unrelated)   8 → N/A      │
+  │                                                                          │
+  │  Exponential backoff retry  |  Checkpoint every 20K rows                 │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 3 — Hybrid Contrastive + Triplet Fine-Tuning         src/train.py │
+  │                                                                          │
+  │  Base model: Qwen3-Embedding-0.6B (595M params)                          │
+  │  Objective 1: WeightedContrastiveLoss  |  margin=0.7  |  batch=8        │
+  │  Objective 2: TripletLoss (cosine)     |  margin=0.5  |  batch=32       │
+  │  Two objectives interleaved via model.fit(train_objectives=[...])        │
+  │  Triplets: on-the-fly construction with transitive inference             │
+  │  Hard negatives selected by descending cosine rank                       │
+  │                                                                          │
+  │  ┌──────────────────────────┐   ┌──────────────────────────────────────┐  │
+  │  │  SLURM Array Job         │   │  Evaluation                          │  │
+  │  │  24 tasks × 1 GPU        │   │  Per-topic binary F1 on held-out     │  │
+  │  │  RTX 4090 × 32GB         │   │  validation pairs                    │  │
+  │  │  Institutional HPC       │   │  Best checkpoint selection           │  │
+  │  └──────────────────────────┘   └──────────────────────────────────────┘  │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 4 — Corpus-Scale Inference                       src/inference.py │
+  │                                                                          │
+  │  8M statutes processed in 24 SLURM shards                                │
+  │  CUDA OOM retry: halves batch size on failure                            │
+  │  Output: zstd-compressed parquet, Arrow fixed-size-list embeddings       │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Stage 5 — Semantic Clustering                           src/cluster.py  │
+  │                                                                          │
+  │  Approach 1 — FAISS K-Means (no dim reduction)                           │
+  │    Raw 1024d embeddings  →  FAISS K-Means, K swept per topic             │
+  │    Best K per topic by pairwise F1 on held-out labels; exhaustive partition│
+  │                                                                           │
+  │  Approach 2 — Dim-reduced HDBSCAN                                        │
+  │    PCA (1024d → 50d)  →  UMAP (50d → 5d, min_dist=0.0, metric=cosine)   │
+  │    → HDBSCAN (min_cluster=15)  → noise reassigned to nearest centroid    │
+  └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 The original pipeline mined approximately 100K labeled pairs, trained with weighted contrastive and triplet objectives, and produced embeddings over the full corpus using 24 Slurm inference shards. The public modules illustrate these stages; the proprietary data and full infrastructure are not included.
