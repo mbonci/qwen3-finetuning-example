@@ -31,9 +31,9 @@ import pyarrow.parquet as pq
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_BATCH_SIZE = 64
-EMBEDDING_DIM = 1024  # Qwen3-Embedding-0.6B output dimension
+EMBEDDING_DIM = 384  # all-MiniLM-L6-v2; use 1024 for Qwen3-Embedding-0.6B
 
 
 # ---------------------------------------------------------------------------

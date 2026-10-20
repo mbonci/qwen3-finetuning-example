@@ -187,7 +187,7 @@ def evaluate_model(
 def main() -> None:
     p = argparse.ArgumentParser(description="Evaluate embedding model with pairwise cluster F1")
     p.add_argument("--pairs", default="data/mock_pairs.jsonl")
-    p.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--k-range", nargs=2, type=int, default=[5, 50], metavar=("K_MIN", "K_MAX"))
     p.add_argument("--k-step", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)

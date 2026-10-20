@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 def run_experiment(
     pairs_path: str,
     output_dir: str,
-    base_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    base_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     epochs: int = 2,
     batch_size: int = 4,
     seed: int = 42,
@@ -154,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Baseline vs fine-tuned experiment on mock data")
     p.add_argument("--pairs", default="data/mock_pairs.jsonl")
     p.add_argument("--output", default="runs/experiment")
-    p.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
