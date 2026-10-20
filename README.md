@@ -1,4 +1,4 @@
-# 📄 Document Intelligence & Representation Learning Pipeline
+# Legal Statute Representation Learning at Scale
 
 ![Python](https://img.shields.io/badge/python-3.10-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -6,117 +6,55 @@
 ![SLURM](https://img.shields.io/badge/HPC-SLURM%20Array-purple?logo=linux&logoColor=white)
 ![FAISS](https://img.shields.io/badge/FAISS-K--Means%20%7C%20HDBSCAN-red)
 
-**Fine-tuned `Qwen3-Embedding-0.6B` on 8 million proprietary legal statutes using contrastive triplet loss, yielding a +0.20 improvement in clustering F1 on semantically similar document pairs. Scaled inference across the full corpus to produce actionable semantic groups via FAISS K-Means and HDBSCAN.**
+**Developed a domain-specific representation-learning pipeline for semantic grouping across approximately 8 million legal statutes.** Combined BM25 and embedding-based candidate mining, LLM-judged similarity labels, contrastive/triplet fine-tuning of `Qwen3-Embedding-0.6B`, and FAISS K-Means/HDBSCAN clustering. Historical evaluation on held-out labeled pairs showed **+0.20 mean F1** versus the base model (see [Results](#results)).
 
 ---
 
-## 🔒 Data Privacy & Compliance Notice
 
-> The training corpus consists of **8 million proprietary legal statutes** sourced from a state-law research archive. Raw text cannot be shared publicly due to data-use agreements and compliance requirements.
+## Results
 
-This repository implements a **mock data strategy** that faithfully mimics the pipeline mechanics without exposing any real corpus content:
+> **Historical proprietary-corpus results.** These figures are not reproducible from the public synthetic fixtures and must not be compared with the demo outputs.
 
-- `src/generate_mock_data.py` produces synthetic statute-like text pairs using topic-aligned templates drawn from real legislative domains (Health, Education, Government Operations, Environment, etc.)
-- Mock pairs reproduce the **boundary-sampling mechanics** of the real pipeline: cosine similarity bins (q40–q100), BM25-retrieved hard negatives, and ordinal judge scores calibrated to mirror the real label distribution
-- All training, inference, and clustering scripts run end-to-end on the mock dataset with no modification
-- Real results reported in this README were produced by running the full pipeline on the proprietary corpus on an institutional HPC cluster
+| Model | Same-cluster pairwise F1 | Notes |
+|---|---|---|
+| `Qwen3-Embedding-0.6B` (base) | 0.61 | Zero-shot, no fine-tuning |
+| `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Fine-tuned with contrastive + triplet loss |
+| **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
+
+**How the +0.20 was measured:** The +0.20 F1 figure in the table above is the mean test-split F1 across topics for the fine-tuned model minus the same for the base model, each at their per-topic best-K, evaluated on the proprietary corpus. Similarity was predicted from shared K-Means cluster membership, not a cosine threshold. See [Evaluation protocol](#evaluation-protocol).
+
+### Embedding similarity before and after fine-tuning
+
+Two representative topics from the proprietary corpus:
+
+| Health | Government Operations |
+|:---:|:---:|
+| ![Health KDE](assets/cosine_kde_health.png) | ![Government Operations KDE](assets/cosine_kde_government_operations.png) |
+
+Filled = before fine-tuning; dashed = after. Green = positive pairs (similar statutes), red = negative pairs (dissimilar). After training the distributions separate cleanly — positives shift right toward cosine ≈ 0.9 and negatives shift left toward ≈ 0.0. `train.py` generates an equivalent plot for any run at `runs/<name>/task_00/visualization/cosine_kde.png`.
 
 ---
 
-## 🏗️ Architecture & Pipeline Overview
+## Pipeline at a glance
 
+```mermaid
+flowchart TD
+    A[8M-statute research corpus] --> B[BM25 + random within-topic candidate mining]
+    B --> C[Cosine similarity stratification]
+    C --> D[LLM-judged ordinal similarity labels]
+    D --> E[Qwen3-Embedding-0.6B fine-tuning]
+    E --> F[Sharded embedding inference]
+    F --> G[FAISS K-Means / PCA + UMAP + HDBSCAN]
+    G --> H[Held-out pairwise cluster evaluation]
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Document Intelligence Pipeline                           │
-└─────────────────────────────────────────────────────────────────────────────┘
 
-  ┌──────────────────┐
-  │  Raw Corpus      │  8M legal statutes across 50 US states
-  │  (proprietary)   │  Deduplicated, topic-classified (8 domains)
-  └────────┬─────────┘
-           │
-           ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 1 — Contrastive Pair Mining                  src/data_pipeline.py │
-  │                                                                          │
-  │  ┌─────────────────────────┐   ┌──────────────────────────────────────┐  │
-  │  │  BM25 (bm25s) Mining    │   │  Random Within-Topic Sampling        │  │
-  │  │                         │   │                                      │  │
-  │  │  • One index per topic  │   │  • 2.5M random within-topic pairs    │  │
-  │  │  • 5% anchors per topic │   │  • Different-state pairs only        │  │
-  │  │    (floor: 1K/topic)    │   │  • Deduplication (order-invariant)   │  │
-  │  │  • Top-100 per anchor   │   │                                      │  │
-  │  │  • Different-state only │   └──────────────────────────────────────┘  │
-  │  └────────────┬────────────┘                         │                   │
-  │               └──── merge + deduplicate (BM25 priority) ────────────────┘│
-  │                                        │                                 │
-  │                                        ▼                                 │
-  │               Per-topic percentile cosine bins (q40–q95)                 │
-  │               Pairs below 40th percentile of topic → excluded            │
-  │                                        │                                 │
-  │                    Stratified sampling from 10 strata → 100K pairs       │
-  │           BM25 × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
-  │         Random × {q40_60, q60_80, q80_90, q90_95, q95_100}              │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-                                     ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 2 — LLM-as-a-Judge Scoring                   src/data_pipeline.py │
-  │                                                                          │
-  │  Model: gpt-4.1-mini  |  Concurrency: 35 workers  |  Scores: 1–8        │
-  │                                                                          │
-  │   1-3 → Positive (related)    4-7 → Negative (unrelated)   8 → N/A      │
-  │                                                                          │
-  │  Exponential backoff retry  |  Checkpoint every 20K rows                 │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-                                     ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 3 — Hybrid Contrastive + Triplet Fine-Tuning         src/train.py │
-  │                                                                          │
-  │  Base model: Qwen3-Embedding-0.6B (595M params)                          │
-  │  Objective 1: WeightedContrastiveLoss  |  margin=0.7  |  batch=8        │
-  │  Objective 2: TripletLoss (cosine)     |  margin=0.5  |  batch=32       │
-  │  Two objectives interleaved via model.fit(train_objectives=[...])        │
-  │  Triplets: on-the-fly construction with transitive inference             │
-  │  Hard negatives selected by descending cosine rank                       │
-  │                                                                          │
-  │  ┌──────────────────────────┐   ┌──────────────────────────────────────┐  │
-  │  │  SLURM Array Job         │   │  Evaluation                          │  │
-  │  │  24 tasks × 1 GPU        │   │  Per-topic binary F1 on held-out     │  │
-  │  │  RTX 4090 × 32GB         │   │  validation pairs                    │  │
-  │  │  Institutional HPC       │   │  Best checkpoint selection           │  │
-  │  └──────────────────────────┘   └──────────────────────────────────────┘  │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-                                     ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 4 — Corpus-Scale Inference                       src/inference.py │
-  │                                                                          │
-  │  8M statutes processed in 24 SLURM shards                                │
-  │  CUDA OOM retry: halves batch size on failure                            │
-  │  Output: zstd-compressed parquet, Arrow fixed-size-list embeddings       │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-                                     ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Stage 5 — Semantic Clustering                           src/cluster.py  │
-  │                                                                          │
-  │  Approach 1 — FAISS K-Means (no dim reduction)                           │
-  │    Raw 1024d embeddings  →  FAISS K-Means, K swept per topic             │
-  │    Best K per topic by pairwise F1 on held-out labels; exhaustive partition│
-  │                                                                           │
-  │  Approach 2 — Dim-reduced HDBSCAN                                        │
-  │    PCA (1024d → 50d)  →  UMAP (50d → 5d, min_dist=0.0, metric=cosine)   │
-  │    → HDBSCAN (min_cluster=15)  → noise reassigned to nearest centroid    │
-  └──────────────────────────────────────────────────────────────────────────┘
-```
+The original pipeline mined approximately 100K labeled pairs, trained with weighted contrastive and triplet objectives, and produced embeddings over the full corpus using 24 Slurm inference shards. The public modules illustrate these stages; the proprietary data and full infrastructure are not included.
 
 ---
 
 ## 🔬 Architecture Deep Dive
 
-### 1. Contrastive Pair Mining
+### 1. Candidate mining and LLM supervision
 
 Naïve random sampling produces easy negatives that carry weak training signal.
 The pipeline mines **hard negatives** — statutes that are lexically similar but
@@ -148,7 +86,7 @@ Key design decisions:
 
 ---
 
-### 2. Hybrid Contrastive + Triplet Loss
+### 2. Hybrid contrastive and triplet fine-tuning
 
 Training uses two interleaved objectives via `model.fit(train_objectives=[...])`:
 
@@ -178,14 +116,32 @@ triplet count from the labeled pairs without additional API calls.
 sorted by descending cosine similarity — the most confusable negatives are
 presented first, keeping gradients informative throughout training.
 
-Both losses call `model(sentence_features[i])["sentence_embedding"]` — the
-differentiable forward path through the transformer. Using `model.encode()` in
-a training loop is a fatal bug: it runs under `torch.no_grad()` and
-`loss.backward()` becomes a no-op.
+Both losses use the differentiable transformer forward pass to propagate gradients into the embedding model.
 
 ---
 
-### 3. Two-Approach Semantic Clustering
+
+#### Training configuration
+
+| Parameter | Value |
+|---|---|
+| Base model | `Qwen/Qwen3-Embedding-0.6B` |
+| Embedding dimension | 1024 |
+| Loss 1 | WeightedContrastiveLoss (cosine distance) |
+| Contrastive margin | 0.7 |
+| Contrastive batch size | 8 |
+| Loss 2 | TripletLoss (cosine distance) |
+| Triplet margin | 0.5 |
+| Triplet batch size | 32 |
+| Learning rate | 2e-5 |
+| Epochs | 3 |
+| Warmup steps | 100 |
+| Optimizer | AdamW |
+| Training pairs | ~100K labeled pairs → ~300K triplets |
+| Hardware | 1× RTX 4090, 32 GB VRAM |
+| HPC cluster | Institutional HPC cluster (SLURM array, 24 tasks) |
+
+### 3. Semantic clustering
 
 After fine-tuning, the full 8M-statute corpus is embedded in parallel across
 24 SLURM shards. Two independent clustering pipelines are run on the resulting
@@ -218,29 +174,7 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 
 ---
 
-## 📊 Results
-
-### Hyperparameters
-
-| Parameter | Value |
-|---|---|
-| Base model | `Qwen/Qwen3-Embedding-0.6B` |
-| Embedding dimension | 1024 |
-| Loss 1 | WeightedContrastiveLoss (cosine distance) |
-| Contrastive margin | 0.7 |
-| Contrastive batch size | 8 |
-| Loss 2 | TripletLoss (cosine distance) |
-| Triplet margin | 0.5 |
-| Triplet batch size | 32 |
-| Learning rate | 2e-5 |
-| Epochs | 3 |
-| Warmup steps | 100 |
-| Optimizer | AdamW |
-| Training pairs | ~100K labeled pairs → ~300K triplets |
-| Hardware | 1× RTX 4090, 32 GB VRAM |
-| HPC cluster | Institutional HPC cluster (SLURM array, 24 tasks) |
-
-### Dimensionality Reduction & Clustering
+#### Clustering configuration
 
 **Approach 1 — FAISS K-Means (`pipeline_kmeans`)**
 
@@ -257,9 +191,11 @@ Raw 1024d embeddings  →  FAISS K-Means, K swept per topic
 | HDBSCAN | 5 | variable | `min_cluster_size=15`, `min_samples=None` (→ min_cluster_size), `cluster_selection=eom` |
 | Noise reassignment | — | — | Noise points (-1) → nearest cluster centroid |
 
-### Validation Methodology
+---
 
-Evaluation is implemented in `src/evaluate.py`. Several design decisions are non-obvious:
+## Evaluation protocol
+
+The historical clustering evaluation used pair labels to assess whether semantic groups recovered known relationships. `src/evaluate.py` provides the public evaluation implementation.
 
 **Prediction rule — cluster membership as binary similarity**
 
@@ -282,7 +218,7 @@ Score 4 is excluded because the LLM judge rubric places it explicitly at the dec
 and recall if included. Score 8 marks pairs the judge could not evaluate (e.g. one statute is
 a procedural header with no semantic content).
 
-**K-selection protocol — per-topic, train/test split**
+**K-selection protocol — per-topic labeled-pair train/test split**
 
 ```
 All labeled pairs (scores 1–3, 5–7)
@@ -301,37 +237,24 @@ Stratifying the split within each topic ensures representative label coverage at
 
 Sweeping K on the full dataset and reporting F1 on the same data inflates results because
 K-Means can find a partition that memorises the labeled pairs. Selecting best K on the train
-split and evaluating on the **held-out test split** tests whether the clusters generalise to
-unseen labeled pairs.
-
-The +0.20 F1 figure in the Performance table is the mean test-split F1 across topics for the
-fine-tuned model minus the same for the base model, each at their per-topic best-K, evaluated
-on the proprietary corpus.
+split and evaluating on the **held-out test split** tests performance on held-out pair labels; it does not by itself establish generalization to entirely unseen documents.
 
 ---
 
-### Performance
+---
 
-> **Historical research results — proprietary corpus only.** The numbers below
-> were produced by running the full pipeline on the institutional HPC cluster
-> against the 8M-statute corpus. They cannot be independently reproduced from
-> this public repository because the training corpus is not included. `src/experiment.py`
-> provides a synthetic demo that verifies gradient flow and metric correctness on
-> mock data; its output should not be compared to these figures.
+## 🔒 Data Privacy & Compliance Notice
 
-| Model | Pairwise Classification F1 | Notes |
-|---|---|---|
-| `Qwen3-Embedding-0.6B` (base) | 0.61 | Zero-shot, no fine-tuning |
-| `Qwen3-Embedding-0.6B` (fine-tuned) | **0.81** | Fine-tuned with contrastive + triplet loss |
-| **Δ improvement** | **+0.20** | On held-out labeled pairs, proprietary corpus |
+> The training corpus consists of **8 million proprietary legal statutes** sourced from a state-law research archive. Raw text cannot be shared publicly due to data-use agreements and compliance requirements.
 
-**Cosine similarity distributions before and after fine-tuning** (two representative topics, proprietary corpus):
+This repository provides **synthetic fixtures and selected executable components** without exposing corpus content:
 
-| Health | Government Operations |
-|:---:|:---:|
-| ![Health KDE](assets/cosine_kde_health.png) | ![Government Operations KDE](assets/cosine_kde_government_operations.png) |
+- `src/generate_mock_data.py` produces synthetic statute-like text pairs using topic-aligned templates drawn from real legislative domains (Health, Education, Government Operations, Environment, etc.)
+- Synthetic pairs and scores support tests of triplet construction, data formats, and evaluation logic; they are **not a substitute for the proprietary training distribution**
+- Selected modules and tests can be exercised on synthetic inputs; the full research results cannot be reproduced without the private corpus
+- Real results reported in this README were produced by running the full pipeline on the proprietary corpus on an institutional HPC cluster
 
-Filled = before fine-tuning; dashed = after. Green = positive pairs (similar statutes), red = negative pairs (dissimilar). After training the distributions separate cleanly — positives shift right toward cosine ≈ 0.9 and negatives shift left toward ≈ 0.0. `train.py` generates an equivalent plot for any run at `runs/<name>/task_00/visualization/cosine_kde.png`.
+---
 
 ---
 
@@ -363,7 +286,7 @@ python src/train.py \
   --batch-size 4
 ```
 
-**4. Extract embeddings and cluster**:
+**4. Extract embeddings; optionally run the standalone clustering smoke test**:
 
 ```bash
 python src/inference.py \
@@ -371,7 +294,7 @@ python src/inference.py \
   --output embeddings/mock \
   --shard 0 --n-shards 1
 
-python src/cluster.py   # end-to-end mock run with random embeddings
+python src/cluster.py   # standalone random-embedding clustering smoke test (not the inference output)
 ```
 
 **5. Baseline vs. fine-tuned experiment (synthetic demo)**:
@@ -381,10 +304,10 @@ python src/experiment.py \
   --pairs  data/mock_pairs.jsonl \
   --output runs/experiment \
   --epochs 2
-# Note: results are from synthetic data; see Performance section above.
+# Note: results are from synthetic data; see Results above.
 ```
 
-**HPC (full corpus)** — submit the SLURM array job:
+**HPC example** — infrastructure-specific Slurm orchestration (not part of the public synthetic validation):
 
 ```bash
 sbatch run_hpc_job.slurm
